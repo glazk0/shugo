@@ -14,7 +14,9 @@ and the package layout.
 - `internal/jev` calls Jev over plain HTTP; there is no SDK.
 - Operator configuration comes from environment variables, parsed in
   `internal/config`. Per-guild settings live in SQLite (`internal/guild`) and
-  are edited through the `/config` slash command.
+  are edited through the `/settings` slash command.
+- Slash commands live in `internal/commands`, one file per command, each
+  returning a `Command` registered with `NewRouter` in `cmd/shugo`.
 - Schema changes are new numbered files in `internal/database/migrations`,
   applied at startup. Never edit a migration that has shipped.
 - Deployed as a Docker image through `compose.yaml`.

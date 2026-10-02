@@ -13,6 +13,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 
 	"github.com/glazk0/shugo/internal/bot"
+	"github.com/glazk0/shugo/internal/commands"
 	"github.com/glazk0/shugo/internal/config"
 	"github.com/glazk0/shugo/internal/database"
 	"github.com/glazk0/shugo/internal/guild"
@@ -54,7 +55,14 @@ func run() error {
 		return err
 	}
 	defer db.Close()
-	settings := guild.NewStore(db)
+	guilds := guild.NewStore(db)
+
+	router, err := commands.NewRouter(logger,
+		commands.Settings(guilds),
+	)
+	if err != nil {
+		return err
+	}
 
 	client := jev.NewClient(cfg.TypeSafeAPIKey,
 		jev.WithEndpoint(cfg.JevEndpoint),
@@ -74,7 +82,7 @@ func run() error {
 	}
 	session.Identify.Intents = bot.Intents
 
-	handler := bot.NewHandler(moderator, store, settings, bot.NewSession(session), logger, bot.Options{
+	handler := bot.NewHandler(moderator, store, guilds, bot.NewSession(session), logger, bot.Options{
 		DryRun:             cfg.DryRun,
 		TimeoutDuration:    cfg.TimeoutDuration,
 		QueueTimeout:       cfg.QueueTimeout,
@@ -92,7 +100,9 @@ func run() error {
 	var tracker bot.Tracker
 	session.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
 	session.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
-	session.AddHandler(bot.OnInteractionCreate(workCtx, settings, &tracker, logger))
+	session.AddHandler(bot.OnGuildCreate(workCtx, guilds, logger))
+	session.AddHandler(bot.OnGuildDelete(workCtx, guilds, logger))
+	session.AddHandler(router.OnInteractionCreate(workCtx, &tracker))
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		logger.Info("connected to discord",
 			slog.String("user", r.User.Username),
@@ -103,7 +113,7 @@ func run() error {
 		if r.Application != nil {
 			appID = r.Application.ID
 		}
-		if _, err := s.ApplicationCommandBulkOverwrite(appID, "", bot.Commands); err != nil {
+		if _, err := s.ApplicationCommandBulkOverwrite(appID, "", router.Definitions()); err != nil {
 			logger.Error("register slash commands", slog.Any("error", err))
 		}
 	})

@@ -94,7 +94,7 @@ func Load(lookup LookupFunc) (Config, error) {
 
 	if _, ok := p.value("LOG_CHANNEL_ID"); ok {
 		cfg.Warnings = append(cfg.Warnings,
-			"LOG_CHANNEL_ID is ignored: each server now picks its report channels with /config log-channel")
+			"LOG_CHANNEL_ID is ignored: each server now picks its report channels with /settings log-channel")
 	}
 
 	p.check(cfg.Policy.Validate())

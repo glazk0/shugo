@@ -18,7 +18,7 @@ System One model, whether it breaks the rules. Jev sees more than the text. It
 also gets the author's account age, how long they have been a member, and their
 recent messages. A deterministic policy turns Jev's answers into a flag, a
 delete or a timeout, and every action is reported to the log channels each
-server picks with `/config`.
+server picks with `/settings`.
 
 ## Contents
 
@@ -45,7 +45,7 @@ server picks with `/config`.
 - **Moderators are exempt.** Members with *Administrator* or
   *Manage Messages* are left alone, threads included.
 - **Per-server settings.** Each server picks its own report channels and
-  exempt channels and roles with `/config`, stored in SQLite.
+  exempt channels and roles with `/settings`, stored in SQLite.
 - **Dry-run mode.** Report what Shugo would do, without touching anything.
 - **Built for production.** A single static binary in a distroless image, with
   bounded concurrency, retries with backoff, and a graceful shutdown that
@@ -75,7 +75,7 @@ It loads `.env` before starting the bot. A plain `go run` does not read
 
 > [!TIP]
 > Start with `DRY_RUN=true` and set a report channel with
-> `/config log-channel set`. That way you can tune the thresholds on real
+> `/settings log-channel set`. That way you can tune the thresholds on real
 > traffic before Shugo deletes anything.
 
 ## Discord setup
@@ -134,7 +134,7 @@ server loses its settings when the container is replaced.
   write to it.
 
 `LOG_CHANNEL_ID` is no longer read. Shugo logs a warning at startup if it is
-still set. Pick report channels with `/config log-channel set` instead.
+still set. Pick report channels with `/settings log-channel set` instead.
 
 ### Using OpenRouter
 
@@ -146,17 +146,17 @@ request body. To use it, set
 
 ## Server settings
 
-Members with *Manage Server* configure Shugo for their server with `/config`.
+Members with *Manage Server* configure Shugo for their server with `/settings`.
 Replies are only visible to the person who ran the command. Server admins can
 let other roles use it under *Server Settings → Integrations*.
 
 | Command | Effect |
 |---|---|
-| `/config show` | Show the current settings |
-| `/config log-channel set kind channel` | Send flag reports, or delete and timeout reports, to a channel |
-| `/config log-channel clear kind` | Remove that channel |
-| `/config exempt-channel add/remove channel` | Skip moderation in a channel and its threads |
-| `/config exempt-role add/remove role` | Skip moderation for members with a role |
+| `/settings show` | Show the current settings |
+| `/settings log-channel set kind channel` | Send flag reports, or delete and timeout reports, to a channel |
+| `/settings log-channel clear kind` | Remove that channel |
+| `/settings exempt-channel add/remove channel` | Skip moderation in a channel and its threads |
+| `/settings exempt-role add/remove role` | Skip moderation for members with a role |
 
 Flags need a human, while deletes and timeouts are already done, so the two
 kinds of report can go to separate channels. When only one is set, it receives
@@ -223,11 +223,24 @@ make build  # binary in bin/shugo
 | `cmd/shugo` | Wiring, signal handling, graceful shutdown |
 | `internal/config` | Environment parsing and validation |
 | `internal/database` | SQLite connection and embedded schema migrations |
-| `internal/guild` | Per-server settings: report channels and exemptions |
+| `internal/guild` | Guilds and their settings: report channels and exemptions |
+| `internal/commands` | Slash command router and one file per command, such as `/settings` |
 | `internal/jev` | Jev HTTP client with retries on 429/529/5xx |
 | `internal/history` | Bounded, TTL-based per-member message cache |
 | `internal/moderation` | State building, Jev questions, decision policy |
-| `internal/bot` | Discord adapter, message handling, enforcement, reports, `/config` |
+| `internal/bot` | Discord adapter, message handling, enforcement, reports |
+
+The database holds three tables: `guilds`, kept in step with the servers
+Shugo is in (`removed_at` marks one it left, with its settings kept for a
+re-invite); `guild_settings`; and `guild_exemptions`. Each row carries
+`created_at`, and the mutable ones `updated_at`, as UTC ISO 8601 text. WAL
+journaling and foreign keys are enabled on every connection.
+
+To add a slash command, write a constructor returning a `commands.Command`
+in its own file under `internal/commands`: its Discord definition plus one
+handler per subcommand path, such as `"log-channel set"`. Then pass it to
+`commands.NewRouter` in `cmd/shugo`. The router refuses to start if a
+subcommand has no handler.
 
 Schema changes go in a new file in `internal/database/migrations`, named with
 the next number (`0002_description.sql`). Shugo applies pending migrations in
