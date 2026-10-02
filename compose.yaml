@@ -9,6 +9,8 @@ services:
     stop_grace_period: 35s
     env_file: .env
     read_only: true
+    volumes:
+      - shugo-data:/data
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -22,3 +24,6 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+volumes:
+  shugo-data:

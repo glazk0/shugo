@@ -21,8 +21,9 @@ type Config struct {
 	JevEndpoint    string
 	JevModel       string
 
-	// LogChannelID receives moderation reports; empty disables reports.
-	LogChannelID    string
+	// DatabasePath is the SQLite file holding per-guild settings.
+	DatabasePath string
+
 	DryRun          bool
 	TimeoutDuration time.Duration
 	Policy          moderation.Policy
@@ -43,6 +44,10 @@ type Config struct {
 	ShutdownTimeout    time.Duration
 
 	LogLevel slog.Level
+
+	// Warnings describe settings that still load but need the operator's
+	// attention, such as variables that no longer have any effect.
+	Warnings []string
 }
 
 // LookupFunc reads an environment variable; os.LookupEnv satisfies it.
@@ -62,7 +67,8 @@ func Load(lookup LookupFunc) (Config, error) {
 		JevEndpoint:    p.string("JEV_ENDPOINT", jev.DefaultEndpoint),
 		JevModel:       p.string("JEV_MODEL", jev.DefaultModel),
 
-		LogChannelID:    p.string("LOG_CHANNEL_ID", ""),
+		DatabasePath: p.string("DATABASE_PATH", "shugo.db"),
+
 		DryRun:          p.bool("DRY_RUN", false),
 		TimeoutDuration: p.duration("TIMEOUT_DURATION", 10*time.Minute),
 		Policy: moderation.Policy{
@@ -85,6 +91,11 @@ func Load(lookup LookupFunc) (Config, error) {
 	}
 
 	cfg.DiscordToken = strings.TrimPrefix(cfg.DiscordToken, "Bot ")
+
+	if _, ok := p.value("LOG_CHANNEL_ID"); ok {
+		cfg.Warnings = append(cfg.Warnings,
+			"LOG_CHANNEL_ID is ignored: each server now picks its report channels with /settings log-channel")
+	}
 
 	p.check(cfg.Policy.Validate())
 	// Discord caps member timeouts at 28 days.

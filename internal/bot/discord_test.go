@@ -2,6 +2,7 @@ package bot
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +69,7 @@ func gatewayMessage() *discordgo.Message {
 		Content:         "hello @everyone",
 		Timestamp:       time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
 		Author:          &discordgo.User{ID: authorID},
-		Member:          &discordgo.Member{JoinedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC)},
+		Member:          &discordgo.Member{JoinedAt: time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC), Roles: []string{"member"}},
 		Attachments:     []*discordgo.MessageAttachment{{}, {}},
 		Mentions:        []*discordgo.User{{ID: "x"}},
 		MentionEveryone: true,
@@ -88,6 +89,7 @@ func TestFromDiscord(t *testing.T) {
 		GuildID:          guildID,
 		ChannelID:        channelID,
 		AuthorID:         authorID,
+		RoleIDs:          []string{"member"},
 		Content:          "hello @everyone",
 		SentAt:           time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
 		Attachments:      2,
@@ -97,8 +99,35 @@ func TestFromDiscord(t *testing.T) {
 		JoinedAt:         time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC),
 	}
 	msg.AuthorCreatedAt = msg.AuthorCreatedAt.UTC()
-	if msg != want {
+	if !reflect.DeepEqual(msg, want) {
 		t.Errorf("FromDiscord() =\n%+v\nwant\n%+v", msg, want)
+	}
+}
+
+func TestParentChannel(t *testing.T) {
+	t.Parallel()
+
+	state := testState(t)
+	tests := []struct {
+		name      string
+		state     *discordgo.State
+		channelID string
+		want      string
+	}{
+		{"thread", state, threadID, overwriteID},
+		{"regular channel", state, channelID, ""},
+		{"unknown channel", state, "missing", ""},
+		{"no state", nil, threadID, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := parentChannel(tt.state, tt.channelID); got != tt.want {
+				t.Errorf("parentChannel(%q) = %q, want %q", tt.channelID, got, tt.want)
+			}
+		})
 	}
 }
 

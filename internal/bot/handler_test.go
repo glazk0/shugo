@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/glazk0/shugo/internal/bot"
+	"github.com/glazk0/shugo/internal/guild"
 	"github.com/glazk0/shugo/internal/history"
 	"github.com/glazk0/shugo/internal/moderation"
 )
@@ -51,12 +52,14 @@ type timeoutCall struct {
 type fakeDiscord struct {
 	mu sync.Mutex
 	// ctxErrs holds ctx.Err() as seen by each call, in call order.
-	ctxErrs    []error
-	deleted    []string
-	timeouts   []timeoutCall
-	reports    []bot.Report
-	deleteErr  error
-	timeoutErr error
+	ctxErrs  []error
+	deleted  []string
+	timeouts []timeoutCall
+	reports  []bot.Report
+	// reportChannels holds the channel of each report, in call order.
+	reportChannels []string
+	deleteErr      error
+	timeoutErr     error
 }
 
 // DeleteMessage implements bot.Discord.
@@ -94,18 +97,36 @@ func (f *fakeDiscord) TimeoutMember(ctx context.Context, guildID, userID string,
 //
 // Parameters:
 //   - ctx (context.Context): its error is recorded.
-//   - _ (string): channel ID, unused.
+//   - channelID (string): recorded.
 //   - r (bot.Report): recorded.
-func (f *fakeDiscord) SendReport(ctx context.Context, _ string, r bot.Report) error {
+func (f *fakeDiscord) SendReport(ctx context.Context, channelID string, r bot.Report) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.reports = append(f.reports, r)
+	f.reportChannels = append(f.reportChannels, channelID)
 	return nil
 }
 
+// fakeSettings serves fixed guild settings, or fails when err is set.
+type fakeSettings struct {
+	settings guild.Settings
+	err      error
+}
+
+// Get implements bot.GuildSettings.
+//
+// Parameters:
+//   - _ (context.Context): unused.
+//   - _ (string): guild ID, unused.
+func (f fakeSettings) Get(_ context.Context, _ string) (guild.Settings, error) {
+	return f.settings, f.err
+}
+
+// defaultSettings reports flags and actions to separate channels.
+var defaultSettings = fakeSettings{settings: guild.Settings{FlagChannelID: "flags", ActionChannelID: "actions"}}
+
 var defaultOpts = bot.Options{
-	LogChannelID:       "log",
 	TimeoutDuration:    10 * time.Minute,
 	QueueTimeout:       time.Second,
 	EvaluationTimeout:  time.Second,
@@ -113,16 +134,27 @@ var defaultOpts = bot.Options{
 	MaxConcurrency:     4,
 }
 
-// setup builds a Handler around fresh fakes.
+// setup builds a Handler around fresh fakes and defaultSettings.
 //
 // Parameters:
 //   - verdict (moderation.Verdict): verdict returned by the fake moderator.
 //   - opts (bot.Options): handler options.
 func setup(verdict moderation.Verdict, opts bot.Options) (*bot.Handler, *fakeModerator, *fakeDiscord) {
+	return setupWithSettings(verdict, opts, defaultSettings)
+}
+
+// setupWithSettings builds a Handler around fresh fakes and the given guild
+// settings.
+//
+// Parameters:
+//   - verdict (moderation.Verdict): verdict returned by the fake moderator.
+//   - opts (bot.Options): handler options.
+//   - settings (bot.GuildSettings): guild settings source.
+func setupWithSettings(verdict moderation.Verdict, opts bot.Options, settings bot.GuildSettings) (*bot.Handler, *fakeModerator, *fakeDiscord) {
 	mod := &fakeModerator{verdict: verdict}
 	dc := &fakeDiscord{}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	h := bot.NewHandler(mod, history.New(10, time.Hour), dc, logger, opts)
+	h := bot.NewHandler(mod, history.New(10, time.Hour), settings, dc, logger, opts)
 	return h, mod, dc
 }
 
@@ -175,6 +207,52 @@ func TestHandleSkipsIgnoredMessages(t *testing.T) {
 				t.Errorf("unexpected enforcement: %+v", dc)
 			}
 		})
+	}
+}
+
+func TestHandleSkipsGuildExemptions(t *testing.T) {
+	t.Parallel()
+
+	settings := fakeSettings{settings: guild.Settings{
+		ActionChannelID:  "actions",
+		ExemptChannelIDs: []string{"bots"},
+		ExemptRoleIDs:    []string{"trusted"},
+	}}
+	tests := []struct {
+		name   string
+		mutate func(*bot.Message)
+	}{
+		{"exempt channel", func(m *bot.Message) { m.ChannelID = "bots" }},
+		{"thread in exempt channel", func(m *bot.Message) { m.ChannelID, m.ParentChannelID = "thread", "bots" }},
+		{"exempt role", func(m *bot.Message) { m.RoleIDs = []string{"member", "trusted"} }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h, mod, dc := setupWithSettings(moderation.Verdict{Action: moderation.ActionTimeout}, defaultOpts, settings)
+			msg := message("1", "free nitro")
+			tt.mutate(&msg)
+
+			if err := h.Handle(t.Context(), msg); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if mod.calls() != 0 || len(dc.deleted)+len(dc.reports) != 0 {
+				t.Errorf("moderated an exempt message: calls = %d, discord = %+v", mod.calls(), dc)
+			}
+		})
+	}
+
+	// Other channels and roles in the same guild are still moderated.
+	h, mod, _ := setupWithSettings(moderation.Verdict{}, defaultOpts, settings)
+	msg := message("2", "hello")
+	msg.RoleIDs = []string{"member"}
+	if err := h.Handle(t.Context(), msg); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if mod.calls() != 1 {
+		t.Errorf("moderator called %d times, want 1", mod.calls())
 	}
 }
 
@@ -236,33 +314,40 @@ func TestHandleEnforcesVerdict(t *testing.T) {
 		name         string
 		action       moderation.Action
 		opts         bot.Options
+		settings     fakeSettings
 		wantDeleted  int
 		wantTimeouts int
-		wantReports  int
+		wantReport   string
 	}{
-		{"none", moderation.ActionNone, defaultOpts, 0, 0, 0},
-		{"flag reports only", moderation.ActionFlag, defaultOpts, 0, 0, 1},
-		{"delete", moderation.ActionDelete, defaultOpts, 1, 0, 1},
-		{"timeout also deletes", moderation.ActionTimeout, defaultOpts, 1, 1, 1},
-		{"dry run only reports", moderation.ActionTimeout, withDryRun(defaultOpts), 0, 0, 1},
-		{"no log channel", moderation.ActionDelete, withoutLogChannel(defaultOpts), 1, 0, 0},
+		{"none", moderation.ActionNone, defaultOpts, defaultSettings, 0, 0, ""},
+		{"flag reports only", moderation.ActionFlag, defaultOpts, defaultSettings, 0, 0, "flags"},
+		{"delete", moderation.ActionDelete, defaultOpts, defaultSettings, 1, 0, "actions"},
+		{"timeout also deletes", moderation.ActionTimeout, defaultOpts, defaultSettings, 1, 1, "actions"},
+		{"dry run only reports", moderation.ActionTimeout, withDryRun(defaultOpts), defaultSettings, 0, 0, "actions"},
+		{"no log channel", moderation.ActionDelete, defaultOpts, fakeSettings{}, 1, 0, ""},
+		{"flag falls back to action channel", moderation.ActionFlag, defaultOpts, fakeSettings{settings: guild.Settings{ActionChannelID: "actions"}}, 0, 0, "actions"},
+		{"settings unavailable", moderation.ActionDelete, defaultOpts, fakeSettings{err: errors.New("disk I/O error")}, 1, 0, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			h, _, dc := setup(moderation.Verdict{Action: tt.action, Category: "spam", Risk: 0.9}, tt.opts)
+			h, _, dc := setupWithSettings(moderation.Verdict{Action: tt.action, Category: "spam", Risk: 0.9}, tt.opts, tt.settings)
 			start := time.Now()
 
 			if err := h.Handle(t.Context(), message("42", "spam spam")); err != nil {
 				t.Fatalf("Handle() error = %v", err)
 			}
 
-			if len(dc.deleted) != tt.wantDeleted || len(dc.timeouts) != tt.wantTimeouts || len(dc.reports) != tt.wantReports {
+			wantReports := 0
+			if tt.wantReport != "" {
+				wantReports = 1
+			}
+			if len(dc.deleted) != tt.wantDeleted || len(dc.timeouts) != tt.wantTimeouts || len(dc.reports) != wantReports {
 				t.Fatalf("deleted/timeouts/reports = %d/%d/%d, want %d/%d/%d",
 					len(dc.deleted), len(dc.timeouts), len(dc.reports),
-					tt.wantDeleted, tt.wantTimeouts, tt.wantReports)
+					tt.wantDeleted, tt.wantTimeouts, wantReports)
 			}
 			if tt.wantDeleted > 0 && dc.deleted[0] != "42" {
 				t.Errorf("deleted %q, want 42", dc.deleted[0])
@@ -276,7 +361,10 @@ func TestHandleEnforcesVerdict(t *testing.T) {
 					t.Errorf("timeout lasts %s, want about %s", d, tt.opts.TimeoutDuration)
 				}
 			}
-			if tt.wantReports > 0 {
+			if wantReports > 0 {
+				if dc.reportChannels[0] != tt.wantReport {
+					t.Errorf("report sent to %q, want %q", dc.reportChannels[0], tt.wantReport)
+				}
 				r := dc.reports[0]
 				if r.DryRun != tt.opts.DryRun || r.Verdict.Action != tt.action || r.Message.ID != "42" || r.Err != nil {
 					t.Errorf("report = %+v", r)
@@ -328,7 +416,7 @@ func TestHandleRespectsCancelledContext(t *testing.T) {
 	opts.MaxConcurrency = 1
 	block := make(chan struct{})
 	mod := &blockingModerator{started: make(chan struct{}), release: block}
-	h := bot.NewHandler(mod, history.New(10, time.Hour), &fakeDiscord{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	h := bot.NewHandler(mod, history.New(10, time.Hour), defaultSettings, &fakeDiscord{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
 
 	// Occupy the only slot.
 	done := make(chan error, 1)
@@ -355,7 +443,7 @@ func TestHandleDropsMessagesAfterQueueTimeout(t *testing.T) {
 	opts.QueueTimeout = 20 * time.Millisecond
 	block := make(chan struct{})
 	mod := &blockingModerator{started: make(chan struct{}), release: block}
-	h := bot.NewHandler(mod, history.New(10, time.Hour), &fakeDiscord{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	h := bot.NewHandler(mod, history.New(10, time.Hour), defaultSettings, &fakeDiscord{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
 
 	done := make(chan error, 1)
 	go func() { done <- h.Handle(context.Background(), message("1", "a")) }()
@@ -379,7 +467,7 @@ func TestHandleEnforcesAfterSlowEvaluation(t *testing.T) {
 	// The verdict arrives just as the evaluation deadline expires.
 	mod := &deadlineModerator{verdict: moderation.Verdict{Action: moderation.ActionTimeout, Category: "scam"}}
 	dc := &fakeDiscord{}
-	h := bot.NewHandler(mod, history.New(10, time.Hour), dc, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	h := bot.NewHandler(mod, history.New(10, time.Hour), defaultSettings, dc, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
 
 	if err := h.Handle(t.Context(), message("1", "free nitro")); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -467,14 +555,5 @@ func (b *blockingModerator) Moderate(ctx context.Context, _ moderation.Input) (m
 //   - o (bot.Options): base options.
 func withDryRun(o bot.Options) bot.Options {
 	o.DryRun = true
-	return o
-}
-
-// withoutLogChannel returns a copy of o with reports disabled.
-//
-// Parameters:
-//   - o (bot.Options): base options.
-func withoutLogChannel(o bot.Options) bot.Options {
-	o.LogChannelID = ""
 	return o
 }

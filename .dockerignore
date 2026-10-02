@@ -7,3 +7,6 @@ bin
 *.md
 compose.yaml
 Dockerfile
+*.db
+*.db-shm
+*.db-wal

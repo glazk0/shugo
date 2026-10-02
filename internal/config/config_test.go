@@ -51,8 +51,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Policy != moderation.DefaultPolicy {
 		t.Errorf("Policy = %+v, want default", cfg.Policy)
 	}
-	if cfg.DryRun || cfg.LogChannelID != "" {
-		t.Errorf("DryRun/LogChannelID = %v/%q", cfg.DryRun, cfg.LogChannelID)
+	if cfg.DryRun || cfg.DatabasePath != "shugo.db" || cfg.Warnings != nil {
+		t.Errorf("DryRun/DatabasePath/Warnings = %v/%q/%v", cfg.DryRun, cfg.DatabasePath, cfg.Warnings)
 	}
 	if cfg.TimeoutDuration != 10*time.Minute || cfg.HistorySize != 10 || cfg.HistoryTTL != 15*time.Minute {
 		t.Errorf("durations/sizes = %v/%d/%v", cfg.TimeoutDuration, cfg.HistorySize, cfg.HistoryTTL)
@@ -75,6 +75,7 @@ func TestLoadOverrides(t *testing.T) {
 		"DISCORD_TOKEN":       "Bot abc",
 		"JEV_MODEL":           "jev-1.13.0",
 		"LOG_CHANNEL_ID":      "123",
+		"DATABASE_PATH":       "/data/shugo.db",
 		"DRY_RUN":             "true",
 		"TIMEOUT_DURATION":    "1h",
 		"FLAG_RISK":           "0.4",
@@ -100,11 +101,14 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.Policy != want {
 		t.Errorf("Policy = %+v, want %+v", cfg.Policy, want)
 	}
-	if cfg.JevModel != "jev-1.13.0" || cfg.LogChannelID != "123" || !cfg.DryRun {
+	if cfg.JevModel != "jev-1.13.0" || cfg.DatabasePath != "/data/shugo.db" || !cfg.DryRun {
 		t.Errorf("cfg = %+v", cfg)
 	}
 	if cfg.TimeoutDuration != time.Hour || cfg.HistorySize != 25 || cfg.HistoryTTL != 30*time.Minute {
 		t.Errorf("durations/sizes = %v/%d/%v", cfg.TimeoutDuration, cfg.HistorySize, cfg.HistoryTTL)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "LOG_CHANNEL_ID") {
+		t.Errorf("Warnings = %v, want one about LOG_CHANNEL_ID", cfg.Warnings)
 	}
 	if cfg.MaxConcurrency != 4 || cfg.LogLevel != slog.LevelDebug {
 		t.Errorf("MaxConcurrency/LogLevel = %d/%v", cfg.MaxConcurrency, cfg.LogLevel)
