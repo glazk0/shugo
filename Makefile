@@ -18,8 +18,10 @@ lint:
 vuln:
 	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
+# Recipes run in /bin/sh, so loading .env works whatever the login shell is.
 run:
-	go run ./cmd/shugo
+	@test -f .env || { echo "missing .env: cp .env.example .env and fill it in" >&2; exit 1; }
+	set -a && . ./.env && set +a && go run ./cmd/shugo
 
 docker:
 	docker compose build --build-arg VERSION=$(VERSION)

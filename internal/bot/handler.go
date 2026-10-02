@@ -32,7 +32,6 @@ type Message struct {
 	UserMentions     int
 	MentionsEveryone bool
 
-	// AuthorCreatedAt is when the author's account was created.
 	AuthorCreatedAt time.Time
 	// JoinedAt is when the author joined the guild; zero if unknown.
 	JoinedAt time.Time
@@ -46,10 +45,8 @@ type Message struct {
 type Report struct {
 	Message Message
 	Verdict moderation.Verdict
-	// DryRun is true when the action was only simulated.
-	DryRun bool
-	// Err holds any enforcement failure, nil on success.
-	Err error
+	DryRun  bool
+	Err     error
 }
 
 // Discord performs the REST calls needed to enforce verdicts.
@@ -67,23 +64,17 @@ type Moderator interface {
 // Options tunes the Handler.
 type Options struct {
 	// LogChannelID receives reports; empty disables them.
-	LogChannelID string
-	// DryRun reports verdicts without deleting or timing out.
-	DryRun bool
-	// TimeoutDuration is how long offending members are timed out for.
+	LogChannelID    string
+	DryRun          bool
 	TimeoutDuration time.Duration
 	// QueueTimeout bounds how long a message waits for an evaluation slot.
-	// A verdict that arrives long after the message was posted is of little
-	// use, and an unbounded queue grows without limit during a raid.
 	QueueTimeout time.Duration
 	// EvaluationTimeout bounds the Jev evaluation of one message.
 	EvaluationTimeout time.Duration
 	// EnforcementTimeout bounds the delete and timeout calls for one verdict,
-	// and separately the report, so a slow evaluation cannot use up the time
-	// needed to act on it.
+	// and separately the report.
 	EnforcementTimeout time.Duration
-	// MaxConcurrency caps in-flight evaluations.
-	MaxConcurrency int
+	MaxConcurrency     int
 }
 
 // Handler moderates incoming messages. It is safe for concurrent use.
