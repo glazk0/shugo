@@ -8,6 +8,11 @@
 *.out
 coverage.*
 
+# Local SQLite database
+*.db
+*.db-shm
+*.db-wal
+
 # Local environment
 .env
 .env.*

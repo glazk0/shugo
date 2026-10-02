@@ -14,6 +14,8 @@ import (
 
 	"github.com/glazk0/shugo/internal/bot"
 	"github.com/glazk0/shugo/internal/config"
+	"github.com/glazk0/shugo/internal/database"
+	"github.com/glazk0/shugo/internal/guild"
 	"github.com/glazk0/shugo/internal/history"
 	"github.com/glazk0/shugo/internal/jev"
 	"github.com/glazk0/shugo/internal/moderation"
@@ -40,9 +42,19 @@ func run() error {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	db, err := database.Open(ctx, cfg.DatabasePath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	settings := guild.NewStore(db)
 
 	client := jev.NewClient(cfg.TypeSafeAPIKey,
 		jev.WithEndpoint(cfg.JevEndpoint),
@@ -62,8 +74,7 @@ func run() error {
 	}
 	session.Identify.Intents = bot.Intents
 
-	handler := bot.NewHandler(moderator, store, bot.NewSession(session), logger, bot.Options{
-		LogChannelID:       cfg.LogChannelID,
+	handler := bot.NewHandler(moderator, store, settings, bot.NewSession(session), logger, bot.Options{
 		DryRun:             cfg.DryRun,
 		TimeoutDuration:    cfg.TimeoutDuration,
 		QueueTimeout:       cfg.QueueTimeout,
@@ -81,10 +92,20 @@ func run() error {
 	var tracker bot.Tracker
 	session.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
 	session.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
-	session.AddHandler(func(_ *discordgo.Session, r *discordgo.Ready) {
+	session.AddHandler(bot.OnInteractionCreate(workCtx, settings, &tracker, logger))
+	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		logger.Info("connected to discord",
 			slog.String("user", r.User.Username),
 			slog.Int("guilds", len(r.Guilds)))
+		// Overwriting on every Ready is idempotent and keeps the commands in
+		// step with this build after an upgrade.
+		appID := r.User.ID
+		if r.Application != nil {
+			appID = r.Application.ID
+		}
+		if _, err := s.ApplicationCommandBulkOverwrite(appID, "", bot.Commands); err != nil {
+			logger.Error("register slash commands", slog.Any("error", err))
+		}
 	})
 
 	if err := session.Open(); err != nil {

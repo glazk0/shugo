@@ -139,6 +139,7 @@ func handleMessage(ctx context.Context, h *Handler, tracker *Tracker, logger *sl
 				slog.Any("error", err))
 		}
 		msg.Exempt = exempt
+		msg.ParentChannelID = parentChannel(state, msg.ChannelID)
 		if err := h.Handle(ctx, msg); err != nil {
 			logger.LogAttrs(ctx, slog.LevelError, "handle message",
 				slog.String("guild_id", msg.GuildID),
@@ -183,8 +184,28 @@ func FromDiscord(m *discordgo.Message) (Message, bool) {
 	}
 	if m.Member != nil {
 		msg.JoinedAt = m.Member.JoinedAt
+		msg.RoleIDs = m.Member.Roles
 	}
 	return msg, true
+}
+
+// parentChannel returns the parent of channelID when it is a thread, so a
+// guild's channel exemption also covers the channel's threads. It returns ""
+// for other channels and for channels missing from the state cache.
+//
+// Parameters:
+//   - state (*discordgo.State): cache holding the guild's channels and
+//     threads; nil resolves nothing.
+//   - channelID (string): channel the message was sent in.
+func parentChannel(state *discordgo.State, channelID string) string {
+	if state == nil {
+		return ""
+	}
+	channel, err := state.Channel(channelID)
+	if err != nil || !channel.IsThread() {
+		return ""
+	}
+	return channel.ParentID
 }
 
 // Exempt reports whether the author of m can moderate the channel the message

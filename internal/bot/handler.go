@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/glazk0/shugo/internal/guild"
 	"github.com/glazk0/shugo/internal/history"
 	"github.com/glazk0/shugo/internal/moderation"
 )
@@ -24,9 +25,14 @@ type Message struct {
 	ID        string
 	GuildID   string
 	ChannelID string
-	AuthorID  string
-	Content   string
-	SentAt    time.Time
+	// ParentChannelID is the channel a thread belongs to; empty outside
+	// threads.
+	ParentChannelID string
+	AuthorID        string
+	// RoleIDs are the author's roles in the guild; nil if unknown.
+	RoleIDs []string
+	Content string
+	SentAt  time.Time
 
 	Attachments      int
 	UserMentions     int
@@ -61,10 +67,14 @@ type Moderator interface {
 	Moderate(ctx context.Context, in moderation.Input) (moderation.Verdict, error)
 }
 
+// GuildSettings looks up the configuration a guild chose for itself.
+// *guild.Store satisfies it.
+type GuildSettings interface {
+	Get(ctx context.Context, guildID string) (guild.Settings, error)
+}
+
 // Options tunes the Handler.
 type Options struct {
-	// LogChannelID receives reports; empty disables them.
-	LogChannelID    string
 	DryRun          bool
 	TimeoutDuration time.Duration
 	// QueueTimeout bounds how long a message waits for an evaluation slot.
@@ -81,6 +91,7 @@ type Options struct {
 type Handler struct {
 	moderator Moderator
 	history   *history.Store
+	settings  GuildSettings
 	discord   Discord
 	logger    *slog.Logger
 	opts      Options
@@ -93,13 +104,15 @@ type Handler struct {
 // Parameters:
 //   - moderator (Moderator): judges each message.
 //   - store (*history.Store): per-member message history.
+//   - settings (GuildSettings): per-guild report channels and exemptions.
 //   - discord (Discord): enforces verdicts.
 //   - logger (*slog.Logger): structured logger.
 //   - opts (Options): behaviour settings.
-func NewHandler(moderator Moderator, store *history.Store, discord Discord, logger *slog.Logger, opts Options) *Handler {
+func NewHandler(moderator Moderator, store *history.Store, settings GuildSettings, discord Discord, logger *slog.Logger, opts Options) *Handler {
 	return &Handler{
 		moderator: moderator,
 		history:   store,
+		settings:  settings,
 		discord:   discord,
 		logger:    logger,
 		opts:      opts,
@@ -109,14 +122,29 @@ func NewHandler(moderator Moderator, store *history.Store, discord Discord, logg
 }
 
 // Handle moderates msg and enforces the resulting verdict. Messages from
-// bots, outside guilds or from exempt members are ignored. An edited message
-// is handled like a new one, replacing its earlier version in the history.
+// bots, outside guilds, from exempt members, or in channels and from roles the
+// guild exempted are ignored. An edited message is handled like a new one,
+// replacing its earlier version in the history.
 //
 // Parameters:
 //   - ctx (context.Context): cancels evaluation and enforcement.
 //   - msg (Message): the message to moderate.
 func (h *Handler) Handle(ctx context.Context, msg Message) error {
 	if msg.GuildID == "" || msg.AuthorIsBot || msg.Exempt {
+		return nil
+	}
+
+	settings, err := h.settings.Get(ctx, msg.GuildID)
+	if err != nil {
+		// Moderate with the defaults rather than letting every message
+		// through while the database is unavailable.
+		h.logger.LogAttrs(ctx, slog.LevelWarn, "load guild settings",
+			slog.String("guild_id", msg.GuildID),
+			slog.String("message_id", msg.ID),
+			slog.Any("error", err))
+	}
+	if settings.ExemptsChannel(msg.ChannelID) || settings.ExemptsChannel(msg.ParentChannelID) ||
+		settings.ExemptsAnyRole(msg.RoleIDs) {
 		return nil
 	}
 
@@ -175,7 +203,7 @@ func (h *Handler) Handle(ctx context.Context, msg Message) error {
 	if verdict.Action == moderation.ActionNone {
 		return nil
 	}
-	return h.enforce(ctx, msg, verdict)
+	return h.enforce(ctx, msg, verdict, settings.ReportChannel(verdict.Action))
 }
 
 // acquire takes an evaluation slot, waiting at most Options.QueueTimeout.
@@ -210,7 +238,9 @@ func (h *Handler) acquire(ctx context.Context) error {
 //     deadline.
 //   - msg (Message): offending message.
 //   - verdict (moderation.Verdict): decision to apply; Action is not None.
-func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.Verdict) error {
+//   - reportChannelID (string): channel that receives the report; "" sends
+//     none.
+func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.Verdict, reportChannelID string) error {
 	reason := fmt.Sprintf("shugo: %s (risk %.0f%%)", verdict.Category, verdict.Risk*100)
 
 	var errs []error
@@ -243,11 +273,11 @@ func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.V
 		slog.Any("error", enforceErr),
 	)
 
-	if h.opts.LogChannelID != "" {
+	if reportChannelID != "" {
 		reportCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
 		defer cancel()
 		report := Report{Message: msg, Verdict: verdict, DryRun: h.opts.DryRun, Err: enforceErr}
-		if err := h.discord.SendReport(reportCtx, h.opts.LogChannelID, report); err != nil {
+		if err := h.discord.SendReport(reportCtx, reportChannelID, report); err != nil {
 			errs = append(errs, fmt.Errorf("send report: %w", err))
 		}
 	}

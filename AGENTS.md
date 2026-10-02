@@ -8,11 +8,15 @@ and the package layout.
 
 ## Tech
 
-- Go, standard library first (`log/slog`, `net/http`). The only direct
-  dependency is `github.com/bwmarrin/discordgo`.
+- Go, standard library first (`log/slog`, `net/http`, `database/sql`). The
+  only direct dependencies are `github.com/bwmarrin/discordgo` and
+  `modernc.org/sqlite`, a pure-Go driver that keeps the binary CGO-free.
 - `internal/jev` calls Jev over plain HTTP; there is no SDK.
-- Configuration comes from environment variables alone, parsed in
-  `internal/config`.
+- Operator configuration comes from environment variables, parsed in
+  `internal/config`. Per-guild settings live in SQLite (`internal/guild`) and
+  are edited through the `/config` slash command.
+- Schema changes are new numbered files in `internal/database/migrations`,
+  applied at startup. Never edit a migration that has shipped.
 - Deployed as a Docker image through `compose.yaml`.
 
 ## Lint and tests
