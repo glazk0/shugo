@@ -9,6 +9,8 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/glazk0/shugo)](go.mod)
 [![Image](https://img.shields.io/badge/image-ghcr.io%2Fglazk0%2Fshugo-blue?logo=docker)](https://github.com/glazk0/shugo/pkgs/container/shugo)
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/shugo?referralCode=8yi4-9&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 </div>
 
 Shugo reads every message in your Discord server and asks Jev, TypeSafe's
