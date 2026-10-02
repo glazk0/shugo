@@ -20,8 +20,9 @@ import (
 var embedded embed.FS
 
 // pragmas run on every connection the pool opens. WAL lets message handlers
-// read while /config writes, busy_timeout makes a writer wait for the lock
-// instead of failing, and temp_store keeps temporary tables off the
+// read while /settings writes, busy_timeout makes a writer wait for the lock
+// instead of failing, foreign_keys enforces the REFERENCES clauses, which
+// SQLite ignores by default, and temp_store keeps temporary tables off the
 // container's read-only filesystem.
 var pragmas = []string{
 	"busy_timeout(5000)",
@@ -38,7 +39,10 @@ var pragmas = []string{
 //   - ctx (context.Context): bounds the connection check and the migrations.
 //   - path (string): database file path.
 func Open(ctx context.Context, path string) (*sql.DB, error) {
-	query := url.Values{"_pragma": pragmas}
+	// Every transaction here writes, so take the write lock at BEGIN: a
+	// deferred transaction that upgrades later can fail with SQLITE_BUSY
+	// without waiting for busy_timeout.
+	query := url.Values{"_pragma": pragmas, "_txlock": {"immediate"}}
 	db, err := sql.Open("sqlite", path+"?"+query.Encode())
 	if err != nil {
 		return nil, fmt.Errorf("database: open %s: %w", path, err)

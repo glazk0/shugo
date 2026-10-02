@@ -1,9 +1,11 @@
 package guild_test
 
 import (
+	"database/sql"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/glazk0/shugo/internal/database"
 	"github.com/glazk0/shugo/internal/guild"
@@ -17,12 +19,108 @@ import (
 func newStore(t *testing.T) *guild.Store {
 	t.Helper()
 
+	store, _ := newStoreWithDB(t)
+	return store
+}
+
+// newStoreWithDB returns a Store over a fresh, migrated database, along with
+// the database itself for inspecting rows directly.
+//
+// Parameters:
+//   - t (*testing.T): registers cleanup and fails the test on errors.
+func newStoreWithDB(t *testing.T) (*guild.Store, *sql.DB) {
+	t.Helper()
+
 	db, err := database.Open(t.Context(), filepath.Join(t.TempDir(), "shugo.db"))
 	if err != nil {
 		t.Fatalf("database.Open() error = %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return guild.NewStore(db)
+	return guild.NewStore(db), db
+}
+
+// guildRow is a row of the guilds table.
+type guildRow struct {
+	createdAt, updatedAt string
+	removedAt            sql.NullString
+}
+
+// readGuild loads the guilds row for id.
+//
+// Parameters:
+//   - t (*testing.T): fails the test on query errors.
+//   - db (*sql.DB): database to read.
+//   - id (string): guild ID.
+func readGuild(t *testing.T, db *sql.DB, id string) guildRow {
+	t.Helper()
+
+	var r guildRow
+	err := db.QueryRowContext(t.Context(),
+		`SELECT created_at, updated_at, removed_at FROM guilds WHERE id = ?`, id,
+	).Scan(&r.createdAt, &r.updatedAt, &r.removedAt)
+	if err != nil {
+		t.Fatalf("read guild %s: %v", id, err)
+	}
+	return r
+}
+
+func TestRecordGuildLifecycle(t *testing.T) {
+	t.Parallel()
+
+	s, db := newStoreWithDB(t)
+	ctx := t.Context()
+
+	if err := s.RecordGuild(ctx, "g"); err != nil {
+		t.Fatalf("RecordGuild() error = %v", err)
+	}
+	joined := readGuild(t, db, "g")
+	if joined.removedAt.Valid {
+		t.Fatalf("guild after join = %+v", joined)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, joined.createdAt); err != nil {
+		t.Errorf("created_at %q is not RFC 3339: %v", joined.createdAt, err)
+	}
+	if err := s.SetLogChannel(ctx, "g", guild.LogFlags, "f"); err != nil {
+		t.Fatalf("SetLogChannel() error = %v", err)
+	}
+
+	if err := s.RecordRemoval(ctx, "g"); err != nil {
+		t.Fatalf("RecordRemoval() error = %v", err)
+	}
+	if removed := readGuild(t, db, "g"); !removed.removedAt.Valid {
+		t.Errorf("removed_at not set after removal: %+v", removed)
+	}
+	// Settings survive the removal so a re-invite keeps them.
+	if got, _ := s.Get(ctx, "g"); got.FlagChannelID != "f" {
+		t.Errorf("FlagChannelID after removal = %q, want f", got.FlagChannelID)
+	}
+
+	if err := s.RecordGuild(ctx, "g"); err != nil {
+		t.Fatalf("RecordGuild() error = %v", err)
+	}
+	back := readGuild(t, db, "g")
+	if back.removedAt.Valid || back.createdAt != joined.createdAt {
+		t.Errorf("guild after rejoin = %+v, want not removed and the same created_at", back)
+	}
+	if back.updatedAt < joined.updatedAt {
+		t.Errorf("updated_at went backwards: %q < %q", back.updatedAt, joined.updatedAt)
+	}
+
+	if err := s.RecordRemoval(ctx, "unknown"); err != nil {
+		t.Errorf("RecordRemoval(unknown) error = %v", err)
+	}
+}
+
+func TestSettingsWriteCreatesGuild(t *testing.T) {
+	t.Parallel()
+
+	s, db := newStoreWithDB(t)
+	if _, err := s.AddExemption(t.Context(), "g", guild.ExemptRole, "r"); err != nil {
+		t.Fatalf("AddExemption() error = %v", err)
+	}
+	if row := readGuild(t, db, "g"); row.removedAt.Valid {
+		t.Errorf("guild row = %+v", row)
+	}
 }
 
 func TestGetReturnsDefaultsForUnknownGuild(t *testing.T) {

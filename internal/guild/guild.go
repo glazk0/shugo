@@ -82,16 +82,24 @@ func (s Settings) ExemptsAnyRole(roleIDs []string) bool {
 	})
 }
 
+// ensureGuild creates the guilds row a settings write refers to, in case the
+// gateway event that normally records the guild was never stored.
+const ensureGuild = `INSERT INTO guilds (id) VALUES (?) ON CONFLICT (id) DO NOTHING`
+
 // setLogChannel holds one upsert per LogKind, so column names never come
 // from a variable.
 var setLogChannel = map[LogKind]string{
 	LogFlags: `INSERT INTO guild_settings (guild_id, flag_channel_id) VALUES (?, ?)
-		ON CONFLICT (guild_id) DO UPDATE SET flag_channel_id = excluded.flag_channel_id`,
+		ON CONFLICT (guild_id) DO UPDATE SET
+			flag_channel_id = excluded.flag_channel_id,
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
 	LogActions: `INSERT INTO guild_settings (guild_id, action_channel_id) VALUES (?, ?)
-		ON CONFLICT (guild_id) DO UPDATE SET action_channel_id = excluded.action_channel_id`,
+		ON CONFLICT (guild_id) DO UPDATE SET
+			action_channel_id = excluded.action_channel_id,
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
 }
 
-// Store reads and writes guild settings in SQLite. It is safe for
+// Store reads and writes guilds and their settings in SQLite. It is safe for
 // concurrent use.
 type Store struct {
 	db *sql.DB
@@ -157,7 +165,14 @@ func (s *Store) SetLogChannel(ctx context.Context, guildID string, kind LogKind,
 	if !ok {
 		return fmt.Errorf("guild: unknown log channel kind %q", kind)
 	}
-	if _, err := s.db.ExecContext(ctx, query, guildID, channelID); err != nil {
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, ensureGuild, guildID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, query, guildID, channelID)
+		return err
+	})
+	if err != nil {
 		return fmt.Errorf("guild: set %s channel for %s: %w", kind, guildID, err)
 	}
 	return nil
@@ -172,9 +187,17 @@ func (s *Store) SetLogChannel(ctx context.Context, guildID string, kind LogKind,
 //   - kind (ExemptionKind): whether targetID is a channel or a role.
 //   - targetID (string): channel or role to exempt.
 func (s *Store) AddExemption(ctx context.Context, guildID string, kind ExemptionKind, targetID string) (bool, error) {
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO guild_exemptions (guild_id, kind, target_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
-		guildID, kind, targetID)
+	var res sql.Result
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, ensureGuild, guildID); err != nil {
+			return err
+		}
+		var err error
+		res, err = tx.ExecContext(ctx,
+			`INSERT INTO guild_exemptions (guild_id, kind, target_id) VALUES (?, ?, ?) ON CONFLICT DO NOTHING`,
+			guildID, kind, targetID)
+		return err
+	})
 	return changed(res, err, "add", kind, guildID)
 }
 
@@ -210,4 +233,62 @@ func changed(res sql.Result, err error, verb string, kind ExemptionKind, guildID
 		return false, fmt.Errorf("guild: %s %s exemption for %s: %w", verb, kind, guildID, err)
 	}
 	return n > 0, nil
+}
+
+// RecordGuild records that the bot is in guildID, clearing removed_at for a
+// guild that invited it back. A guild already present is left untouched, so
+// the gateway replaying every guild at startup costs no writes.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the write.
+//   - guildID (string): guild the bot is in.
+func (s *Store) RecordGuild(ctx context.Context, guildID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO guilds (id) VALUES (?)
+		ON CONFLICT (id) DO UPDATE SET
+			removed_at = NULL,
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE removed_at IS NOT NULL`,
+		guildID)
+	if err != nil {
+		return fmt.Errorf("guild: record guild %s: %w", guildID, err)
+	}
+	return nil
+}
+
+// RecordRemoval marks guildID as left, keeping its settings in case the bot
+// is invited back.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the write.
+//   - guildID (string): guild the bot was removed from.
+func (s *Store) RecordRemoval(ctx context.Context, guildID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE guilds SET
+			removed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		WHERE id = ? AND removed_at IS NULL`,
+		guildID)
+	if err != nil {
+		return fmt.Errorf("guild: record removal of %s: %w", guildID, err)
+	}
+	return nil
+}
+
+// inTx runs fn in a transaction, committing when it returns nil.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the transaction.
+//   - fn (func(*sql.Tx) error): statements to run.
+func (s *Store) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Rollback is a no-op once Commit has succeeded.
+	defer func() { _ = tx.Rollback() }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

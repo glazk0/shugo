@@ -69,6 +69,17 @@ func TestOpenAppliesEmbeddedMigrations(t *testing.T) {
 	if mode != "wal" {
 		t.Errorf("journal_mode = %q, want wal", mode)
 	}
+	var fk int
+	if err := db.QueryRowContext(t.Context(), "PRAGMA foreign_keys").Scan(&fk); err != nil {
+		t.Fatalf("read foreign_keys: %v", err)
+	}
+	if fk != 1 {
+		t.Errorf("foreign_keys = %d, want 1", fk)
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO guild_settings (guild_id) VALUES ('missing')")
+	if err == nil || !strings.Contains(err.Error(), "FOREIGN KEY") {
+		t.Errorf("insert without a guild error = %v, want a foreign key violation", err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
