@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+/shugo
+*.exe
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,9 @@
+.git
+.github
+.env
+.env.*
+bin
+*.out
+*.md
+compose.yaml
+Dockerfile
