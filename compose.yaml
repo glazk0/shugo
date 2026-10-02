@@ -6,6 +6,8 @@ services:
         VERSION: ${VERSION:-dev}
     image: ghcr.io/glazk0/shugo:${VERSION:-latest}
     restart: unless-stopped
+    # Longer than SHUTDOWN_TIMEOUT so in-flight messages can finish.
+    stop_grace_period: 35s
     env_file: .env
     read_only: true
     security_opt:

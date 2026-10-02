@@ -40,8 +40,16 @@ type Config struct {
 
 	// MaxConcurrency caps in-flight Jev evaluations.
 	MaxConcurrency int
+	// QueueTimeout is how long a message may wait for a free evaluation slot
+	// before it is dropped.
+	QueueTimeout time.Duration
 	// EvaluationTimeout bounds a single message evaluation, retries included.
 	EvaluationTimeout time.Duration
+	// EnforcementTimeout bounds the Discord calls that apply a verdict, and
+	// separately the report sent afterwards.
+	EnforcementTimeout time.Duration
+	// ShutdownTimeout is how long shutdown waits for in-flight messages.
+	ShutdownTimeout time.Duration
 
 	// LogLevel is the minimum level written by the logger.
 	LogLevel slog.Level
@@ -77,8 +85,11 @@ func Load(lookup LookupFunc) (Config, error) {
 		HistorySize: p.int("HISTORY_SIZE", 10),
 		HistoryTTL:  p.duration("HISTORY_TTL", 15*time.Minute),
 
-		MaxConcurrency:    p.int("MAX_CONCURRENCY", 16),
-		EvaluationTimeout: p.duration("EVALUATION_TIMEOUT", 20*time.Second),
+		MaxConcurrency:     p.int("MAX_CONCURRENCY", 16),
+		QueueTimeout:       p.duration("QUEUE_TIMEOUT", 5*time.Second),
+		EvaluationTimeout:  p.duration("EVALUATION_TIMEOUT", 20*time.Second),
+		EnforcementTimeout: p.duration("ENFORCEMENT_TIMEOUT", 10*time.Second),
+		ShutdownTimeout:    p.duration("SHUTDOWN_TIMEOUT", 30*time.Second),
 
 		LogLevel: p.level("LOG_LEVEL", slog.LevelInfo),
 	}
@@ -99,8 +110,18 @@ func Load(lookup LookupFunc) (Config, error) {
 	if cfg.MaxConcurrency < 1 {
 		p.fail("MAX_CONCURRENCY must be at least 1")
 	}
-	if cfg.EvaluationTimeout <= 0 {
-		p.fail("EVALUATION_TIMEOUT must be positive")
+	for _, d := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"QUEUE_TIMEOUT", cfg.QueueTimeout},
+		{"EVALUATION_TIMEOUT", cfg.EvaluationTimeout},
+		{"ENFORCEMENT_TIMEOUT", cfg.EnforcementTimeout},
+		{"SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout},
+	} {
+		if d.value <= 0 {
+			p.fail(d.name + " must be positive")
+		}
 	}
 
 	if err := errors.Join(p.errs...); err != nil {

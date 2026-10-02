@@ -208,25 +208,85 @@ func TestEvaluateDoesNotRetryMalformedBody(t *testing.T) {
 	}
 }
 
-func TestEvaluateStopsWhenContextCancelled(t *testing.T) {
+func TestEvaluateFailsFastOnLongRetryAfter(t *testing.T) {
 	t.Parallel()
 
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	t.Cleanup(srv.Close)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	start := time.Now()
+	_, err := newClient(srv, 5).Evaluate(t.Context(), jev.Request{State: "hi"})
+	if apiErr, ok := errors.AsType[*jev.APIError](err); !ok || apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("Evaluate() error = %v, want the 429 APIError", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Evaluate() waited %s for a Retry-After beyond the limit", elapsed)
+	}
+}
+
+func TestEvaluateFailsFastWhenRetryWouldPassDeadline(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := jev.NewClient("test-key",
+		jev.WithEndpoint(srv.URL),
+		jev.WithHTTPClient(srv.Client()),
+		jev.WithRetry(5, time.Millisecond, 5*time.Second),
+	)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 
 	start := time.Now()
-	_, err := newClient(srv, 5).Evaluate(ctx, jev.Request{State: "hi"})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Evaluate() error = %v, want deadline exceeded", err)
+	_, err := client.Evaluate(ctx, jev.Request{State: "hi"})
+	if _, ok := errors.AsType[*jev.APIError](err); !ok {
+		t.Fatalf("Evaluate() error = %v, want *APIError", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("calls = %d, want 1", got)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("Evaluate() slept %s instead of failing fast", elapsed)
+	}
+}
+
+func TestEvaluateStopsWhenContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := jev.NewClient("test-key",
+		jev.WithEndpoint(srv.URL),
+		jev.WithHTTPClient(srv.Client()),
+		jev.WithRetry(5, time.Hour, time.Hour),
+	)
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	start := time.Now()
+	_, err := client.Evaluate(ctx, jev.Request{State: "hi"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Evaluate() error = %v, want context.Canceled", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("Evaluate() honoured Retry-After past the deadline (%s)", elapsed)
+		t.Errorf("Evaluate() kept backing off after cancellation (%s)", elapsed)
 	}
 }
 

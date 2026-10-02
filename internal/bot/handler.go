@@ -14,6 +14,10 @@ import (
 	"github.com/glazk0/shugo/internal/moderation"
 )
 
+// ErrOverloaded is returned when a message waited longer than
+// Options.QueueTimeout for an evaluation slot and was dropped.
+var ErrOverloaded = errors.New("bot: moderation queue is full")
+
 // Message is a guild message reduced to what moderation needs, independent
 // of the Discord library.
 type Message struct {
@@ -68,8 +72,16 @@ type Options struct {
 	DryRun bool
 	// TimeoutDuration is how long offending members are timed out for.
 	TimeoutDuration time.Duration
-	// EvaluationTimeout bounds moderation and enforcement of one message.
+	// QueueTimeout bounds how long a message waits for an evaluation slot.
+	// A verdict that arrives long after the message was posted is of little
+	// use, and an unbounded queue grows without limit during a raid.
+	QueueTimeout time.Duration
+	// EvaluationTimeout bounds the Jev evaluation of one message.
 	EvaluationTimeout time.Duration
+	// EnforcementTimeout bounds the delete and timeout calls for one verdict,
+	// and separately the report, so a slow evaluation cannot use up the time
+	// needed to act on it.
+	EnforcementTimeout time.Duration
 	// MaxConcurrency caps in-flight evaluations.
 	MaxConcurrency int
 }
@@ -106,7 +118,8 @@ func NewHandler(moderator Moderator, store *history.Store, discord Discord, logg
 }
 
 // Handle moderates msg and enforces the resulting verdict. Messages from
-// bots, outside guilds or from exempt members are ignored.
+// bots, outside guilds or from exempt members are ignored. An edited message
+// is handled like a new one, replacing its earlier version in the history.
 //
 // Parameters:
 //   - ctx (context.Context): cancels evaluation and enforcement.
@@ -117,30 +130,27 @@ func (h *Handler) Handle(ctx context.Context, msg Message) error {
 	}
 
 	now := h.now()
-	prior := h.history.Recent(msg.GuildID, msg.AuthorID, now)
-	h.history.Add(msg.GuildID, msg.AuthorID, history.Entry{
+	prior := h.history.Record(msg.GuildID, msg.AuthorID, history.Entry{
 		MessageID: msg.ID,
 		ChannelID: msg.ChannelID,
 		Content:   msg.Content,
 		At:        msg.SentAt,
-	})
+	}, now)
 
 	if strings.TrimSpace(msg.Content) == "" {
 		// Attachment-only messages carry nothing Jev can read yet.
 		return nil
 	}
 
-	select {
-	case h.sem <- struct{}{}:
-		defer func() { <-h.sem }()
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := h.acquire(ctx); err != nil {
+		return fmt.Errorf("moderate message %s: %w", msg.ID, err)
 	}
+	defer func() { <-h.sem }()
 
-	ctx, cancel := context.WithTimeout(ctx, h.opts.EvaluationTimeout)
+	evalCtx, cancel := context.WithTimeout(ctx, h.opts.EvaluationTimeout)
 	defer cancel()
 
-	verdict, err := h.moderator.Moderate(ctx, moderation.Input{
+	verdict, err := h.moderator.Moderate(evalCtx, moderation.Input{
 		Message: moderation.Message{
 			ChannelID:        msg.ChannelID,
 			Content:          msg.Content,
@@ -177,10 +187,36 @@ func (h *Handler) Handle(ctx context.Context, msg Message) error {
 	return h.enforce(ctx, msg, verdict)
 }
 
-// enforce applies verdict to msg and reports the outcome.
+// acquire takes an evaluation slot, waiting at most Options.QueueTimeout.
 //
 // Parameters:
-//   - ctx (context.Context): request context.
+//   - ctx (context.Context): aborts the wait.
+func (h *Handler) acquire(ctx context.Context) error {
+	select {
+	case h.sem <- struct{}{}:
+		return nil
+	default:
+	}
+
+	timer := time.NewTimer(h.opts.QueueTimeout)
+	defer timer.Stop()
+	select {
+	case h.sem <- struct{}{}:
+		return nil
+	case <-timer.C:
+		return ErrOverloaded
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// enforce applies verdict to msg and reports the outcome. The Discord calls
+// and the report each get their own EnforcementTimeout, so a failed or slow
+// enforcement still leaves time to tell moderators about it.
+//
+// Parameters:
+//   - ctx (context.Context): parent context, not bound by the evaluation
+//     deadline.
 //   - msg (Message): offending message.
 //   - verdict (moderation.Verdict): decision to apply; Action is not None.
 func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.Verdict) error {
@@ -188,17 +224,19 @@ func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.V
 
 	var errs []error
 	if !h.opts.DryRun {
+		actCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
 		if verdict.Action >= moderation.ActionDelete {
-			if err := h.discord.DeleteMessage(ctx, msg.ChannelID, msg.ID, reason); err != nil {
+			if err := h.discord.DeleteMessage(actCtx, msg.ChannelID, msg.ID, reason); err != nil {
 				errs = append(errs, fmt.Errorf("delete message: %w", err))
 			}
 		}
 		if verdict.Action >= moderation.ActionTimeout {
 			until := h.now().Add(h.opts.TimeoutDuration)
-			if err := h.discord.TimeoutMember(ctx, msg.GuildID, msg.AuthorID, until, reason); err != nil {
+			if err := h.discord.TimeoutMember(actCtx, msg.GuildID, msg.AuthorID, until, reason); err != nil {
 				errs = append(errs, fmt.Errorf("timeout member: %w", err))
 			}
 		}
+		cancel()
 	}
 	enforceErr := errors.Join(errs...)
 
@@ -215,8 +253,10 @@ func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.V
 	)
 
 	if h.opts.LogChannelID != "" {
+		reportCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
+		defer cancel()
 		report := Report{Message: msg, Verdict: verdict, DryRun: h.opts.DryRun, Err: enforceErr}
-		if err := h.discord.SendReport(ctx, h.opts.LogChannelID, report); err != nil {
+		if err := h.discord.SendReport(reportCtx, h.opts.LogChannelID, report); err != nil {
 			errs = append(errs, fmt.Errorf("send report: %w", err))
 		}
 	}

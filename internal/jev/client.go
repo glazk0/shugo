@@ -86,7 +86,8 @@ func WithHTTPClient(hc *http.Client) Option {
 }
 
 // WithRetry configures retries for 429, 529 and 5xx responses and transport
-// errors. Delays grow exponentially from base up to max, with full jitter.
+// errors. Delays grow exponentially from base up to max, with full jitter. A
+// server Retry-After longer than maxDelay ends the call instead of waiting.
 //
 // Parameters:
 //   - maxRetries (int): retries after the first attempt; 0 disables them.
@@ -148,6 +149,13 @@ func (c *Client) Evaluate(ctx context.Context, req Request) (*Response, error) {
 		delay := retryAfter
 		if delay <= 0 {
 			delay = c.backoff(attempt)
+		} else if delay > c.maxDelay {
+			return nil, fmt.Errorf("jev: server asked to retry in %s, beyond the %s limit: %w", delay, c.maxDelay, err)
+		}
+		// Sleeping past the deadline only holds the caller's resources for
+		// a retry that can never be sent.
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+			return nil, fmt.Errorf("jev: retry in %s would pass the deadline: %w", delay, err)
 		}
 		timer := time.NewTimer(delay)
 		select {

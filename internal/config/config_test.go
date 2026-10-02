@@ -60,6 +60,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxConcurrency != 16 || cfg.EvaluationTimeout != 20*time.Second {
 		t.Errorf("concurrency = %d/%v", cfg.MaxConcurrency, cfg.EvaluationTimeout)
 	}
+	if cfg.QueueTimeout != 5*time.Second || cfg.EnforcementTimeout != 10*time.Second || cfg.ShutdownTimeout != 30*time.Second {
+		t.Errorf("queue/enforcement/shutdown timeouts = %v/%v/%v", cfg.QueueTimeout, cfg.EnforcementTimeout, cfg.ShutdownTimeout)
+	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel = %v", cfg.LogLevel)
 	}
@@ -81,6 +84,9 @@ func TestLoadOverrides(t *testing.T) {
 		"HISTORY_SIZE":        "25",
 		"HISTORY_TTL":         " 30m ",
 		"MAX_CONCURRENCY":     "4",
+		"QUEUE_TIMEOUT":       "2s",
+		"ENFORCEMENT_TIMEOUT": "3s",
+		"SHUTDOWN_TIMEOUT":    "1m",
 		"LOG_LEVEL":           "debug",
 	})))
 	if err != nil {
@@ -103,6 +109,9 @@ func TestLoadOverrides(t *testing.T) {
 	if cfg.MaxConcurrency != 4 || cfg.LogLevel != slog.LevelDebug {
 		t.Errorf("MaxConcurrency/LogLevel = %d/%v", cfg.MaxConcurrency, cfg.LogLevel)
 	}
+	if cfg.QueueTimeout != 2*time.Second || cfg.EnforcementTimeout != 3*time.Second || cfg.ShutdownTimeout != time.Minute {
+		t.Errorf("queue/enforcement/shutdown timeouts = %v/%v/%v", cfg.QueueTimeout, cfg.EnforcementTimeout, cfg.ShutdownTimeout)
+	}
 }
 
 func TestLoadReportsAllErrors(t *testing.T) {
@@ -114,6 +123,7 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"HISTORY_SIZE":     "0",
 		"TIMEOUT_DURATION": "29d",
 		"FLAG_RISK":        "0.95",
+		"QUEUE_TIMEOUT":    "-1s",
 		"LOG_LEVEL":        "loud",
 	}))
 	if err == nil {
@@ -127,6 +137,7 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"HISTORY_SIZE must be at least 1",
 		`TIMEOUT_DURATION: invalid value "29d"`,
 		"flag risk 0.95 exceeds delete risk",
+		"QUEUE_TIMEOUT must be positive",
 		`LOG_LEVEL: invalid value "loud"`,
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -141,5 +152,16 @@ func TestLoadRejectsTimeoutAboveDiscordLimit(t *testing.T) {
 	_, err := config.Load(env(required(map[string]string{"TIMEOUT_DURATION": "700h"})))
 	if err == nil || !strings.Contains(err.Error(), "TIMEOUT_DURATION") {
 		t.Errorf("Load() error = %v, want TIMEOUT_DURATION error", err)
+	}
+}
+
+func TestLoadRejectsNaNThreshold(t *testing.T) {
+	t.Parallel()
+
+	// strconv.ParseFloat accepts "NaN", and NaN fails every comparison, so
+	// it would otherwise silently disable every threshold check.
+	_, err := config.Load(env(required(map[string]string{"FLAG_RISK": "NaN", "DELETE_RISK": "NaN"})))
+	if err == nil || !strings.Contains(err.Error(), "flag risk threshold NaN is outside [0, 1]") {
+		t.Errorf("Load() error = %v, want NaN rejected", err)
 	}
 }

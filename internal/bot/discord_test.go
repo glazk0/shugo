@@ -19,6 +19,8 @@ const (
 	modRoleID     = "mod"
 	everyoneRole  = guildID
 	ownerID       = "owner"
+	threadID      = "t"
+	overwriteID   = "overwritten"
 	authorCreated = 1462015105796
 )
 
@@ -37,7 +39,19 @@ func testState(t *testing.T) *discordgo.State {
 			{ID: everyoneRole, Permissions: discordgo.PermissionSendMessages},
 			{ID: modRoleID, Permissions: discordgo.PermissionManageMessages},
 		},
-		Channels: []*discordgo.Channel{{ID: channelID, GuildID: guildID}},
+		Channels: []*discordgo.Channel{
+			{ID: channelID, GuildID: guildID},
+			{
+				ID:      overwriteID,
+				GuildID: guildID,
+				PermissionOverwrites: []*discordgo.PermissionOverwrite{
+					{ID: authorID, Type: discordgo.PermissionOverwriteTypeMember, Allow: discordgo.PermissionManageMessages},
+				},
+			},
+		},
+		Threads: []*discordgo.Channel{
+			{ID: threadID, GuildID: guildID, ParentID: overwriteID, Type: discordgo.ChannelTypeGuildPublicThread},
+		},
 	})
 	if err != nil {
 		t.Fatalf("GuildAdd() error = %v", err)
@@ -64,7 +78,7 @@ func gatewayMessage() *discordgo.Message {
 func TestFromDiscord(t *testing.T) {
 	t.Parallel()
 
-	msg, ok := FromDiscord(testState(t), gatewayMessage())
+	msg, ok := FromDiscord(gatewayMessage())
 	if !ok {
 		t.Fatal("FromDiscord() ok = false")
 	}
@@ -88,20 +102,17 @@ func TestFromDiscord(t *testing.T) {
 	}
 }
 
-func TestFromDiscordExemptions(t *testing.T) {
+func TestFromDiscordBotAuthors(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		mutate     func(*discordgo.Message)
-		wantExempt bool
-		wantBot    bool
+		name    string
+		mutate  func(*discordgo.Message)
+		wantBot bool
 	}{
-		{"regular member", func(*discordgo.Message) {}, false, false},
-		{"moderator role", func(m *discordgo.Message) { m.Member.Roles = []string{modRoleID} }, true, false},
-		{"guild owner", func(m *discordgo.Message) { m.Author.ID = ownerID }, true, false},
-		{"bot author", func(m *discordgo.Message) { m.Author.Bot = true }, false, true},
-		{"webhook", func(m *discordgo.Message) { m.WebhookID = "w" }, false, true},
+		{"regular member", func(*discordgo.Message) {}, false},
+		{"bot author", func(m *discordgo.Message) { m.Author.Bot = true }, true},
+		{"webhook", func(m *discordgo.Message) { m.WebhookID = "w" }, true},
 	}
 
 	for _, tt := range tests {
@@ -110,14 +121,76 @@ func TestFromDiscordExemptions(t *testing.T) {
 
 			m := gatewayMessage()
 			tt.mutate(m)
-			msg, ok := FromDiscord(testState(t), m)
+			msg, ok := FromDiscord(m)
 			if !ok {
 				t.Fatal("FromDiscord() ok = false")
 			}
-			if msg.Exempt != tt.wantExempt || msg.AuthorIsBot != tt.wantBot {
-				t.Errorf("Exempt/AuthorIsBot = %v/%v, want %v/%v", msg.Exempt, msg.AuthorIsBot, tt.wantExempt, tt.wantBot)
+			if msg.AuthorIsBot != tt.wantBot {
+				t.Errorf("AuthorIsBot = %v, want %v", msg.AuthorIsBot, tt.wantBot)
 			}
 		})
+	}
+}
+
+func TestExempt(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*discordgo.Message)
+		want   bool
+	}{
+		{"regular member", func(*discordgo.Message) {}, false},
+		{"moderator role", func(m *discordgo.Message) { m.Member.Roles = []string{modRoleID} }, true},
+		{"guild owner", func(m *discordgo.Message) { m.Author.ID = ownerID }, true},
+		{"channel overwrite", func(m *discordgo.Message) { m.ChannelID = overwriteID }, true},
+		{"thread inherits parent overwrite", func(m *discordgo.Message) { m.ChannelID = threadID }, true},
+		{"uncached channel falls back to roles", func(m *discordgo.Message) {
+			m.ChannelID = "uncached"
+			m.Member.Roles = []string{modRoleID}
+		}, true},
+		{"uncached channel regular member", func(m *discordgo.Message) { m.ChannelID = "uncached" }, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := gatewayMessage()
+			tt.mutate(m)
+			got, err := Exempt(testState(t), m)
+			if err != nil {
+				t.Fatalf("Exempt() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("Exempt() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExemptLooksUpMissingMember(t *testing.T) {
+	t.Parallel()
+
+	state := testState(t)
+	if err := state.MemberAdd(&discordgo.Member{GuildID: guildID, User: &discordgo.User{ID: authorID}, Roles: []string{modRoleID}}); err != nil {
+		t.Fatalf("MemberAdd() error = %v", err)
+	}
+	m := gatewayMessage()
+	m.Member = nil
+
+	if got, err := Exempt(state, m); err != nil || !got {
+		t.Errorf("Exempt() = %v, %v; want true from the cached member", got, err)
+	}
+}
+
+func TestExemptReportsUnknownGuild(t *testing.T) {
+	t.Parallel()
+
+	m := gatewayMessage()
+	m.GuildID = "unknown"
+	if got, err := Exempt(testState(t), m); err == nil || got {
+		t.Errorf("Exempt() = %v, %v; want an error", got, err)
 	}
 }
 
@@ -139,25 +212,24 @@ func TestFromDiscordRejects(t *testing.T) {
 
 			m := gatewayMessage()
 			tt.mutate(m)
-			if _, ok := FromDiscord(nil, m); ok {
+			if _, ok := FromDiscord(m); ok {
 				t.Error("FromDiscord() ok = true, want false")
 			}
 		})
 	}
 
-	if _, ok := FromDiscord(nil, nil); ok {
+	if _, ok := FromDiscord(nil); ok {
 		t.Error("FromDiscord(nil) ok = true, want false")
 	}
 }
 
-func TestFromDiscordWithoutState(t *testing.T) {
+func TestExemptWithoutState(t *testing.T) {
 	t.Parallel()
 
 	m := gatewayMessage()
 	m.Member.Roles = []string{modRoleID}
-	msg, ok := FromDiscord(nil, m)
-	if !ok || msg.Exempt {
-		t.Errorf("FromDiscord(nil state) = %+v, %v; want not exempt", msg, ok)
+	if got, err := Exempt(nil, m); err != nil || got {
+		t.Errorf("Exempt(nil state) = %v, %v; want not exempt", got, err)
 	}
 }
 

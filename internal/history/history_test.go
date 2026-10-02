@@ -132,3 +132,66 @@ func TestStoreIsSafeForConcurrentUse(t *testing.T) {
 		t.Errorf("Len() = %d, want 3", s.Len())
 	}
 }
+
+func TestRecordReturnsPriorEntries(t *testing.T) {
+	t.Parallel()
+
+	s := history.New(5, time.Minute)
+	if got := s.Record("g", "u", entry("old", 0), t0); len(got) != 0 {
+		t.Errorf("Record(first) = %v, want empty", ids(got))
+	}
+	s.Record("g", "u", entry("a", 50*time.Second), t0.Add(50*time.Second))
+
+	got := ids(s.Record("g", "u", entry("b", 70*time.Second), t0.Add(70*time.Second)))
+	if fmt.Sprint(got) != "[a]" {
+		t.Errorf("Record() = %v, want [a] (expired entry hidden, new entry excluded)", got)
+	}
+	if got := ids(s.Recent("g", "u", t0.Add(70*time.Second))); fmt.Sprint(got) != "[a b]" {
+		t.Errorf("Recent() = %v, want [a b]", got)
+	}
+}
+
+func TestRecordReplacesEditedMessage(t *testing.T) {
+	t.Parallel()
+
+	s := history.New(5, time.Hour)
+	s.Record("g", "u", entry("1", 0), t0)
+	s.Record("g", "u", entry("2", time.Second), t0)
+
+	edited := entry("1", 0)
+	edited.Content = "edited"
+	got := s.Record("g", "u", edited, t0.Add(time.Minute))
+	if fmt.Sprint(ids(got)) != "[2]" {
+		t.Errorf("Record(edit) = %v, want [2] without the edited message itself", ids(got))
+	}
+
+	all := s.Recent("g", "u", t0.Add(time.Minute))
+	if len(all) != 2 || all[0].MessageID != "1" || all[0].Content != "edited" {
+		t.Errorf("Recent() = %+v, want the edit to replace message 1 in place", all)
+	}
+}
+
+func TestRecordSeesConcurrentMessages(t *testing.T) {
+	t.Parallel()
+
+	const n = 20
+	s := history.New(n, time.Hour)
+	seen := make([]int, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			seen[i] = len(s.Record("g", "u", entry(fmt.Sprint(i), 0), t0))
+		})
+	}
+	wg.Wait()
+
+	// Each call must observe every call that completed before it, so the
+	// prior counts are exactly 0, 1, …, n-1 in some order.
+	counts := make(map[int]bool, n)
+	for _, c := range seen {
+		counts[c] = true
+	}
+	if len(counts) != n {
+		t.Errorf("prior counts = %v, want each of 0..%d exactly once", seen, n-1)
+	}
+}

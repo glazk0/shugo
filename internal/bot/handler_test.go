@@ -3,6 +3,7 @@ package bot_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -48,7 +49,9 @@ type timeoutCall struct {
 
 // fakeDiscord records enforcement calls and can be told to fail them.
 type fakeDiscord struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	// ctxErrs holds ctx.Err() as seen by each call, in call order.
+	ctxErrs    []error
 	deleted    []string
 	timeouts   []timeoutCall
 	reports    []bot.Report
@@ -59,13 +62,14 @@ type fakeDiscord struct {
 // DeleteMessage implements bot.Discord.
 //
 // Parameters:
-//   - _ (context.Context): unused.
+//   - ctx (context.Context): its error is recorded.
 //   - _ (string): channel ID, unused.
 //   - messageID (string): recorded.
 //   - _ (string): reason, unused.
-func (f *fakeDiscord) DeleteMessage(_ context.Context, _, messageID, _ string) error {
+func (f *fakeDiscord) DeleteMessage(ctx context.Context, _, messageID, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.deleted = append(f.deleted, messageID)
 	return f.deleteErr
 }
@@ -73,14 +77,15 @@ func (f *fakeDiscord) DeleteMessage(_ context.Context, _, messageID, _ string) e
 // TimeoutMember implements bot.Discord.
 //
 // Parameters:
-//   - _ (context.Context): unused.
+//   - ctx (context.Context): its error is recorded.
 //   - guildID (string): recorded.
 //   - userID (string): recorded.
 //   - until (time.Time): recorded.
 //   - _ (string): reason, unused.
-func (f *fakeDiscord) TimeoutMember(_ context.Context, guildID, userID string, until time.Time, _ string) error {
+func (f *fakeDiscord) TimeoutMember(ctx context.Context, guildID, userID string, until time.Time, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.timeouts = append(f.timeouts, timeoutCall{guildID, userID, until})
 	return f.timeoutErr
 }
@@ -88,21 +93,24 @@ func (f *fakeDiscord) TimeoutMember(_ context.Context, guildID, userID string, u
 // SendReport implements bot.Discord.
 //
 // Parameters:
-//   - _ (context.Context): unused.
+//   - ctx (context.Context): its error is recorded.
 //   - _ (string): channel ID, unused.
 //   - r (bot.Report): recorded.
-func (f *fakeDiscord) SendReport(_ context.Context, _ string, r bot.Report) error {
+func (f *fakeDiscord) SendReport(ctx context.Context, _ string, r bot.Report) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.reports = append(f.reports, r)
 	return nil
 }
 
 var defaultOpts = bot.Options{
-	LogChannelID:      "log",
-	TimeoutDuration:   10 * time.Minute,
-	EvaluationTimeout: time.Second,
-	MaxConcurrency:    4,
+	LogChannelID:       "log",
+	TimeoutDuration:    10 * time.Minute,
+	QueueTimeout:       time.Second,
+	EvaluationTimeout:  time.Second,
+	EnforcementTimeout: time.Second,
+	MaxConcurrency:     4,
 }
 
 // setup builds a Handler around fresh fakes.
@@ -337,6 +345,98 @@ func TestHandleRespectsCancelledContext(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Errorf("first Handle() error = %v", err)
 	}
+}
+
+func TestHandleDropsMessagesAfterQueueTimeout(t *testing.T) {
+	t.Parallel()
+
+	opts := defaultOpts
+	opts.MaxConcurrency = 1
+	opts.QueueTimeout = 20 * time.Millisecond
+	block := make(chan struct{})
+	mod := &blockingModerator{started: make(chan struct{}), release: block}
+	h := bot.NewHandler(mod, history.New(10, time.Hour), &fakeDiscord{}, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+
+	done := make(chan error, 1)
+	go func() { done <- h.Handle(context.Background(), message("1", "a")) }()
+	<-mod.started
+
+	if err := h.Handle(t.Context(), message("2", "b")); !errors.Is(err, bot.ErrOverloaded) {
+		t.Errorf("Handle() error = %v, want ErrOverloaded", err)
+	}
+
+	close(block)
+	if err := <-done; err != nil {
+		t.Errorf("first Handle() error = %v", err)
+	}
+}
+
+func TestHandleEnforcesAfterSlowEvaluation(t *testing.T) {
+	t.Parallel()
+
+	opts := defaultOpts
+	opts.EvaluationTimeout = 20 * time.Millisecond
+	// The verdict arrives just as the evaluation deadline expires.
+	mod := &deadlineModerator{verdict: moderation.Verdict{Action: moderation.ActionTimeout, Category: "scam"}}
+	dc := &fakeDiscord{}
+	h := bot.NewHandler(mod, history.New(10, time.Hour), dc, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+
+	if err := h.Handle(t.Context(), message("1", "free nitro")); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(dc.ctxErrs) != 3 {
+		t.Fatalf("Discord calls = %d, want delete, timeout and report", len(dc.ctxErrs))
+	}
+	for i, err := range dc.ctxErrs {
+		if err != nil {
+			t.Errorf("Discord call %d ran with an expired context: %v", i, err)
+		}
+	}
+}
+
+func TestHandleSeesConcurrentMessagesFromSameAuthor(t *testing.T) {
+	t.Parallel()
+
+	const n = 8
+	opts := defaultOpts
+	opts.MaxConcurrency = n
+	h, mod, _ := setup(moderation.Verdict{}, opts)
+
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			if err := h.Handle(t.Context(), message(fmt.Sprint(i), "free nitro")); err != nil {
+				t.Errorf("Handle() error = %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	// Every message must see all those recorded before it, so the history
+	// lengths are exactly 0, 1, …, n-1 in some order.
+	lengths := make(map[int]bool, n)
+	for _, in := range mod.inputs {
+		lengths[len(in.History)] = true
+	}
+	if len(lengths) != n {
+		t.Errorf("history lengths = %v, want each of 0..%d exactly once", lengths, n-1)
+	}
+}
+
+// deadlineModerator waits for its context to expire, then answers anyway,
+// like a Jev response that lands right at the evaluation deadline.
+type deadlineModerator struct {
+	verdict moderation.Verdict
+}
+
+// Moderate implements bot.Moderator.
+//
+// Parameters:
+//   - ctx (context.Context): waited on until done.
+//   - _ (moderation.Input): unused.
+func (d *deadlineModerator) Moderate(ctx context.Context, _ moderation.Input) (moderation.Verdict, error) {
+	<-ctx.Done()
+	return d.verdict, nil
 }
 
 // blockingModerator blocks until release is closed.

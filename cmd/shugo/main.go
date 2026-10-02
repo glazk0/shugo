@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -31,7 +30,8 @@ func main() {
 }
 
 // run loads the configuration, connects to Discord and blocks until the
-// process receives SIGINT or SIGTERM.
+// process receives SIGINT or SIGTERM, then lets in-flight messages finish for
+// up to the shutdown timeout. A second signal stops the process immediately.
 func run() error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
@@ -63,15 +63,24 @@ func run() error {
 	session.Identify.Intents = bot.Intents
 
 	handler := bot.NewHandler(moderator, store, bot.NewSession(session), logger, bot.Options{
-		LogChannelID:      cfg.LogChannelID,
-		DryRun:            cfg.DryRun,
-		TimeoutDuration:   cfg.TimeoutDuration,
-		EvaluationTimeout: cfg.EvaluationTimeout,
-		MaxConcurrency:    cfg.MaxConcurrency,
+		LogChannelID:       cfg.LogChannelID,
+		DryRun:             cfg.DryRun,
+		TimeoutDuration:    cfg.TimeoutDuration,
+		QueueTimeout:       cfg.QueueTimeout,
+		EvaluationTimeout:  cfg.EvaluationTimeout,
+		EnforcementTimeout: cfg.EnforcementTimeout,
+		MaxConcurrency:     cfg.MaxConcurrency,
 	})
 
-	var inflight sync.WaitGroup
-	session.AddHandler(bot.OnMessageCreate(ctx, handler, &inflight, logger))
+	// Evaluations run on their own context rather than the signal context,
+	// so the shutdown signal stops new work without aborting Jev calls and
+	// Discord actions that are already under way.
+	workCtx, cancelWork := context.WithCancel(context.Background())
+	defer cancelWork()
+
+	var tracker bot.Tracker
+	session.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
+	session.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
 	session.AddHandler(func(_ *discordgo.Session, r *discordgo.Ready) {
 		logger.Info("connected to discord",
 			slog.String("user", r.User.Username),
@@ -87,10 +96,16 @@ func run() error {
 		slog.Bool("dry_run", cfg.DryRun))
 
 	<-ctx.Done()
+	stop()
 	logger.Info("shutting down")
 
 	closeErr := session.Close()
-	inflight.Wait()
+	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancelDrain()
+	if err := tracker.Close(drainCtx); err != nil {
+		logger.Warn("abandoning in-flight messages", slog.Duration("shutdown_timeout", cfg.ShutdownTimeout))
+	}
+	cancelWork()
 	if closeErr != nil {
 		return fmt.Errorf("close discord gateway: %w", closeErr)
 	}

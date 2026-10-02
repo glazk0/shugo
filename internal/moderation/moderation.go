@@ -127,7 +127,9 @@ func (a Action) String() string {
 // Verdict is the moderator's decision together with the signals behind it.
 type Verdict struct {
 	Action Action
-	// Category is the most likely violation category, CategoryNone included.
+	// Category is the violation category Jev chose. It is CategoryNone only
+	// when Action is ActionNone; otherwise it is the most likely category
+	// other than CategoryNone.
 	Category string
 	// Risk is the probability that the message violates any rule, i.e.
 	// 1 - P(none).
@@ -176,7 +178,9 @@ func (p Policy) Validate() error {
 		{"suspicion", p.Suspicion},
 	}
 	for _, t := range thresholds {
-		if t.value < 0 || t.value > 1 {
+		// Written as a negated range check so NaN, which fails every
+		// comparison, is rejected too.
+		if !(t.value >= 0 && t.value <= 1) {
 			return fmt.Errorf("moderation: %s threshold %v is outside [0, 1]", t.name, t.value)
 		}
 	}
@@ -248,6 +252,12 @@ func (m *Moderator) Moderate(ctx context.Context, in Input) (Verdict, error) {
 		return Verdict{}, err
 	}
 	v.Action = m.policy.Decide(v.Risk, v.Severity, v.Suspicion)
+	if v.Action != ActionNone && v.Category == CategoryNone {
+		// Jev's single best guess can be "none" while the other categories
+		// together still carry enough risk to act on; name the likeliest of
+		// them so reports and audit logs say why the message was acted on.
+		v.Category = topViolation(resp.Answers[qViolation].Probabilities)
+	}
 	return v, nil
 }
 
@@ -286,6 +296,24 @@ func readAnswers(resp *jev.Response) (Verdict, error) {
 		Model:     resp.Model,
 		Usage:     resp.Usage,
 	}, nil
+}
+
+// topViolation returns the most probable category other than CategoryNone,
+// breaking ties by name, or CategoryNone when there is no other category.
+//
+// Parameters:
+//   - probabilities (map[string]float64): Jev's per-category probabilities.
+func topViolation(probabilities map[string]float64) string {
+	best, bestP := CategoryNone, -1.0
+	for category, p := range probabilities {
+		if category == CategoryNone {
+			continue
+		}
+		if p > bestP || (p == bestP && category < best) {
+			best, bestP = category, p
+		}
+	}
+	return best
 }
 
 // answer fetches the answer for key and checks its type.

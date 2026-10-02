@@ -6,12 +6,15 @@ context about the author, then acts on the answers.
 
 ## How it works
 
-Each `MESSAGE_CREATE` event goes through these steps:
+Each `MESSAGE_CREATE` event, and each `MESSAGE_UPDATE` caused by an author
+editing their message, goes through these steps:
 
 1. **Filter.** Shugo skips DMs, system messages, bots, webhooks, and members
-   with *Administrator* or *Manage Messages* in the channel.
+   with *Administrator* or *Manage Messages* in the channel. Messages in a
+   thread are checked against the parent channel's permissions.
 2. **Remember.** The message goes into an in-memory history keyed by guild and
-   member, which keeps the last `HISTORY_SIZE` messages for `HISTORY_TTL`.
+   member, which keeps the last `HISTORY_SIZE` messages for `HISTORY_TTL`. An
+   edit replaces the original version instead of adding a second entry.
 3. **Describe.** Shugo builds a JSON state from:
    - the message content, attachment count and mentions
    - the account age, read from the user ID snowflake (e.g. `5 hours (brand new account)`)
@@ -35,7 +38,8 @@ Each `MESSAGE_CREATE` event goes through these steps:
    Here *risk* is `1 − P(none)` and *suspicious* means
    `P(suspicious_author) ≥ SUSPICION_THRESHOLD`. A suspicious author on its own
    never triggers an action. It only raises the action for a message that is
-   already borderline.
+   already borderline. When Jev's top choice is `none` but the risk is still
+   high enough to act, the report names the most likely violation instead.
 6. **Enforce and report.** Shugo deletes the message and/or times the author
    out, then posts an embed to `LOG_CHANNEL_ID`. With `DRY_RUN=true` it only
    posts the report.
@@ -71,7 +75,10 @@ Shugo reads its configuration from environment variables. `.env.example` lists t
 | `HISTORY_SIZE` | `10` | Messages remembered per member |
 | `HISTORY_TTL` | `15m` | How long a remembered message stays relevant |
 | `MAX_CONCURRENCY` | `16` | Maximum Jev requests in flight |
-| `EVALUATION_TIMEOUT` | `20s` | Time limit per message, retries included |
+| `QUEUE_TIMEOUT` | `5s` | How long a message waits for a free slot before it is dropped |
+| `EVALUATION_TIMEOUT` | `20s` | Time limit for the Jev evaluation of a message, retries included |
+| `ENFORCEMENT_TIMEOUT` | `10s` | Time limit for the delete and timeout calls, and separately for the report |
+| `SHUTDOWN_TIMEOUT` | `30s` | How long shutdown waits for in-flight messages |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 Jev is also served through OpenRouter's Decisions API, which accepts the same

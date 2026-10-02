@@ -3,6 +3,7 @@ package moderation_test
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -96,6 +97,7 @@ func TestPolicyValidate(t *testing.T) {
 		{"negative threshold", moderation.Policy{FlagRisk: -0.1, DeleteRisk: 0.9}, true},
 		{"threshold above one", moderation.Policy{FlagRisk: 0.5, DeleteRisk: 1.1}, true},
 		{"flag above delete", moderation.Policy{FlagRisk: 0.9, DeleteRisk: 0.5}, true},
+		{"NaN threshold", moderation.Policy{FlagRisk: math.NaN(), DeleteRisk: math.NaN(), TimeoutSeverity: 0.5, Suspicion: 0.5}, true},
 	}
 
 	for _, tt := range tests {
@@ -175,6 +177,29 @@ func TestModerate(t *testing.T) {
 				t.Error("request state is nil")
 			}
 		})
+	}
+}
+
+func TestModerateNamesViolationWhenNoneIsTopChoice(t *testing.T) {
+	t.Parallel()
+
+	resp := response("none", 0.4, 1.5, 0.1)
+	resp.Answers["violation"] = jev.Answer{
+		Type:          jev.TypeChoice,
+		Choice:        "none",
+		Probabilities: map[string]float64{"none": 0.4, "spam": 0.25, "scam": 0.35},
+	}
+	m, err := moderation.New(&fakeEvaluator{resp: resp}, moderation.DefaultPolicy)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	v, err := m.Moderate(t.Context(), moderation.Input{Now: time.Now()})
+	if err != nil {
+		t.Fatalf("Moderate() error = %v", err)
+	}
+	if v.Action != moderation.ActionFlag || v.Category != "scam" {
+		t.Errorf("Moderate() = %s/%s, want flag/scam", v.Action, v.Category)
 	}
 }
 

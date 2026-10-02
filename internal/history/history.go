@@ -56,15 +56,42 @@ func New(size int, ttl time.Duration) *Store {
 func (s *Store) Add(guildID, userID string, e Entry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.append(key{guildID, userID}, e)
+}
+
+// Record stores e for the given member and returns the member's other
+// unexpired entries as they were before e arrived, oldest first. Both happen
+// under one lock, so concurrent messages from the same member always see each
+// other. An entry with the same MessageID, as left by an edited message, is
+// replaced in place rather than duplicated, and is not returned.
+//
+// Parameters:
+//   - guildID (string): guild the message was sent in.
+//   - userID (string): author of the message.
+//   - e (Entry): the message to remember.
+//   - now (time.Time): reference time used to apply the TTL.
+func (s *Store) Record(guildID, userID string, e Entry, now time.Time) []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	k := key{guildID, userID}
 	list := s.entries[k]
-	list = append(list, e)
-	if len(list) > s.size {
-		// Copy into a fresh slice so the evicted prefix can be collected.
-		list = append([]Entry(nil), list[len(list)-s.size:]...)
+	prior := make([]Entry, 0, len(list))
+	replaced := false
+	for i, old := range list {
+		if e.MessageID != "" && old.MessageID == e.MessageID {
+			list[i] = e
+			replaced = true
+			continue
+		}
+		if s.alive(old, now) {
+			prior = append(prior, old)
+		}
 	}
-	s.entries[k] = list
+	if !replaced {
+		s.append(k, e)
+	}
+	return prior
 }
 
 // Recent returns a copy of the member's unexpired entries, oldest first.
@@ -137,6 +164,22 @@ func (s *Store) Run(ctx context.Context, interval time.Duration) {
 			s.Prune(now)
 		}
 	}
+}
+
+// append adds e to the member's list, evicting the oldest entry when the
+// list is full. The caller must hold s.mu.
+//
+// Parameters:
+//   - k (key): member to append to.
+//   - e (Entry): the message to remember.
+func (s *Store) append(k key, e Entry) {
+	list := s.entries[k]
+	list = append(list, e)
+	if len(list) > s.size {
+		// Copy into a fresh slice so the evicted prefix can be collected.
+		list = append([]Entry(nil), list[len(list)-s.size:]...)
+	}
+	s.entries[k] = list
 }
 
 // alive reports whether e is still within the TTL at now.
