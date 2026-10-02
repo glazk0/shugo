@@ -16,29 +16,21 @@ import (
 // Config holds every runtime setting.
 type Config struct {
 	// DiscordToken is the bot token, without the "Bot " prefix.
-	DiscordToken string
-	// TypeSafeAPIKey authenticates against the Jev API.
+	DiscordToken   string
 	TypeSafeAPIKey string
-	// JevEndpoint is the System One endpoint URL.
-	JevEndpoint string
-	// JevModel is the Jev model alias or pinned version.
-	JevModel string
+	JevEndpoint    string
+	JevModel       string
 
 	// LogChannelID receives moderation reports; empty disables reports.
-	LogChannelID string
-	// DryRun reports what would happen without deleting or timing out.
-	DryRun bool
-	// TimeoutDuration is how long offending members are timed out for.
+	LogChannelID    string
+	DryRun          bool
 	TimeoutDuration time.Duration
-	// Policy holds the moderation thresholds.
-	Policy moderation.Policy
+	Policy          moderation.Policy
 
 	// HistorySize is how many recent messages are kept per member.
 	HistorySize int
-	// HistoryTTL is how long a message stays in a member's history.
-	HistoryTTL time.Duration
+	HistoryTTL  time.Duration
 
-	// MaxConcurrency caps in-flight Jev evaluations.
 	MaxConcurrency int
 	// QueueTimeout is how long a message may wait for a free evaluation slot
 	// before it is dropped.
@@ -48,10 +40,8 @@ type Config struct {
 	// EnforcementTimeout bounds the Discord calls that apply a verdict, and
 	// separately the report sent afterwards.
 	EnforcementTimeout time.Duration
-	// ShutdownTimeout is how long shutdown waits for in-flight messages.
-	ShutdownTimeout time.Duration
+	ShutdownTimeout    time.Duration
 
-	// LogLevel is the minimum level written by the logger.
 	LogLevel slog.Level
 }
 

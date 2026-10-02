@@ -158,8 +158,6 @@ func TestLoadRejectsTimeoutAboveDiscordLimit(t *testing.T) {
 func TestLoadRejectsNaNThreshold(t *testing.T) {
 	t.Parallel()
 
-	// strconv.ParseFloat accepts "NaN", and NaN fails every comparison, so
-	// it would otherwise silently disable every threshold check.
 	_, err := config.Load(env(required(map[string]string{"FLAG_RISK": "NaN", "DELETE_RISK": "NaN"})))
 	if err == nil || !strings.Contains(err.Error(), "flag risk threshold NaN is outside [0, 1]") {
 		t.Errorf("Load() error = %v, want NaN rejected", err)

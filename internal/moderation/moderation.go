@@ -76,7 +76,6 @@ type Message struct {
 
 // Author describes who sent the message.
 type Author struct {
-	// CreatedAt is when the Discord account was created.
 	CreatedAt time.Time
 	// JoinedAt is when the author joined the guild; zero if unknown.
 	JoinedAt time.Time
@@ -139,9 +138,8 @@ type Verdict struct {
 	// Suspicion is the probability that the author is a bot, raider or
 	// compromised account.
 	Suspicion float64
-	// Model is the Jev model version that produced the answers.
-	Model string
-	Usage jev.Usage
+	Model     string
+	Usage     jev.Usage
 }
 
 // Policy maps Jev's answers to an Action. All values are in [0, 1].
@@ -253,9 +251,8 @@ func (m *Moderator) Moderate(ctx context.Context, in Input) (Verdict, error) {
 	}
 	v.Action = m.policy.Decide(v.Risk, v.Severity, v.Suspicion)
 	if v.Action != ActionNone && v.Category == CategoryNone {
-		// Jev's single best guess can be "none" while the other categories
-		// together still carry enough risk to act on; name the likeliest of
-		// them so reports and audit logs say why the message was acted on.
+		// Jev's top choice can be "none" while the other categories together
+		// still carry enough risk to act on.
 		v.Category = topViolation(resp.Answers[qViolation].Probabilities)
 	}
 	return v, nil
