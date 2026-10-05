@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -33,8 +34,9 @@ func main() {
 }
 
 // run loads the configuration, connects to Discord and blocks until the
-// process receives SIGINT or SIGTERM, then lets in-flight messages finish for
-// up to the shutdown timeout. A second signal stops the process immediately.
+// process receives SIGINT or SIGTERM or a shard can no longer reconnect, then
+// lets in-flight messages finish for up to the shutdown timeout. A second
+// signal stops the process immediately.
 func run() error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
@@ -76,7 +78,7 @@ func run() error {
 	store := history.New(cfg.HistorySize, cfg.HistoryTTL)
 	go store.Run(ctx, time.Minute)
 
-	shards, err := newShards(cfg)
+	shards, err := bot.NewShards(cfg.DiscordToken, cfg.ShardCount, logger)
 	if err != nil {
 		return err
 	}
@@ -123,17 +125,21 @@ func run() error {
 		}
 	})
 
-	// A signal during startup stops opening shards and falls through to the
-	// normal shutdown, which drains the shards that already connected.
-	if err := shards.Open(ctx); err != nil && ctx.Err() == nil {
-		return fmt.Errorf("open discord gateway: %w", err)
+	// A signal during startup stops connecting shards and goes through the
+	// same shutdown, which waits for messages the connected shards took.
+	gatewayErr := shards.Open(ctx)
+	if errors.Is(gatewayErr, context.Canceled) {
+		gatewayErr = nil
+	} else if gatewayErr == nil {
+		logger.Info("shugo started",
+			slog.String("version", version),
+			slog.String("jev_model", cfg.JevModel),
+			slog.Bool("dry_run", cfg.DryRun))
+		select {
+		case <-ctx.Done():
+		case gatewayErr = <-shards.Failed():
+		}
 	}
-	logger.Info("shugo started",
-		slog.String("version", version),
-		slog.String("jev_model", cfg.JevModel),
-		slog.Bool("dry_run", cfg.DryRun))
-
-	<-ctx.Done()
 	stop()
 	logger.Info("shutting down")
 
@@ -144,28 +150,11 @@ func run() error {
 		logger.Warn("abandoning in-flight messages", slog.Duration("shutdown_timeout", cfg.ShutdownTimeout))
 	}
 	cancelWork()
+	if gatewayErr != nil {
+		return fmt.Errorf("discord gateway: %w", gatewayErr)
+	}
 	if closeErr != nil {
 		return fmt.Errorf("close discord gateway: %w", closeErr)
 	}
 	return nil
-}
-
-// newShards asks Discord how to shard the bot and creates the sessions.
-//
-// Parameters:
-//   - cfg (config.Config): supplies the bot token and shard count.
-func newShards(cfg config.Config) (*bot.Shards, error) {
-	rest, err := discordgo.New("Bot " + cfg.DiscordToken)
-	if err != nil {
-		return nil, fmt.Errorf("create discord session: %w", err)
-	}
-	gateway, err := rest.GatewayBot()
-	if err != nil {
-		return nil, fmt.Errorf("query discord gateway: %w", err)
-	}
-	plan, err := bot.PlanShards(gateway, cfg.ShardCount)
-	if err != nil {
-		return nil, err
-	}
-	return bot.NewShards(cfg.DiscordToken, plan)
 }

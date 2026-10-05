@@ -142,13 +142,18 @@ still set. Pick report channels with `/settings log-channel set` instead.
 Discord requires a bot in 2,500 or more servers to split its gateway
 connection into shards, each serving a share of the servers. Shugo runs every
 shard in one process. By default it asks Discord how many shards to use at each
-startup. Set `SHARD_COUNT` to pin the number instead. Shards connect as fast
-as Discord's `max_concurrency` allows, which is one every five seconds for most
-bots. Slash commands are registered by shard 0.
+startup. Set `SHARD_COUNT` to pin the number instead; Shugo warns when it is
+below Discord's recommendation. Shards connect as fast as Discord's
+`max_concurrency` allows, which is one every five seconds for most bots, and
+reconnects after an outage follow the same pace. A shard that fails to connect
+is retried on its own with backoff. Slash commands are registered by shard 0.
 
 Discord limits how many sessions a bot may start per day and resets the token
 of a bot that goes over. Shugo checks the remaining budget before it connects
-and refuses to start when the budget cannot cover every shard.
+and refuses to start unless it covers every shard twice, which leaves each
+shard room to start a fresh session after losing one. Shugo stops when
+Discord rejects a shard for good, such as for an invalid token or a disabled
+intent, rather than retrying.
 
 ### Using OpenRouter
 

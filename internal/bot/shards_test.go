@@ -3,12 +3,15 @@ package bot
 import (
 	"context"
 	"errors"
-	"slices"
+	"io"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
 )
 
 func TestPlanShards(t *testing.T) {
@@ -36,23 +39,28 @@ func TestPlanShards(t *testing.T) {
 		{
 			name: "recommended count",
 			gw:   gateway(3, 1000, 1),
-			want: ShardPlan{Count: 3, MaxConcurrency: 1},
+			want: ShardPlan{Count: 3, Recommended: 3, MaxConcurrency: 1},
 		},
 		{
 			name:  "configured count wins",
 			gw:    gateway(3, 1000, 16),
 			count: 8,
-			want:  ShardPlan{Count: 8, MaxConcurrency: 16},
+			want:  ShardPlan{Count: 8, Recommended: 3, MaxConcurrency: 16},
 		},
 		{
 			name: "missing values default to one",
 			gw:   gateway(0, 1000, 0),
-			want: ShardPlan{Count: 1, MaxConcurrency: 1},
+			want: ShardPlan{Count: 1, Recommended: 1, MaxConcurrency: 1},
 		},
 		{
-			name:    "session starts exhausted",
-			gw:      gateway(4, 3, 1),
-			wantErr: "3 more session starts until the limit resets in 1m30s, fewer than the 4 shards",
+			name: "budget covers every shard twice",
+			gw:   gateway(4, 8, 1),
+			want: ShardPlan{Count: 4, Recommended: 4, MaxConcurrency: 1},
+		},
+		{
+			name:    "budget leaves no reserve",
+			gw:      gateway(4, 7, 1),
+			wantErr: "7 more session starts until the limit resets in 1m30s, fewer than twice the 4 shards",
 		},
 	}
 	for _, tt := range tests {
@@ -76,13 +84,36 @@ func TestPlanShards(t *testing.T) {
 	}
 }
 
+// testShards builds n unopened shards whose identify slots and retries take
+// a millisecond, with open replaced by fn when it is not nil.
+//
+// Parameters:
+//   - t (*testing.T): closes the shards when the test ends.
+//   - n (int): number of shards.
+//   - fn (func(int) error): stands in for connecting a shard.
+func testShards(t *testing.T, n int, fn func(int) error) *Shards {
+	t.Helper()
+	first, err := newSession("Bot token", discordgo.NewRatelimiter())
+	if err != nil {
+		t.Fatalf("newSession() error = %v", err)
+	}
+	sh, err := newShards(first, ShardPlan{Count: n, Recommended: n, MaxConcurrency: n}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("newShards() error = %v", err)
+	}
+	sh.gate = newIdentifyGate(n, time.Millisecond)
+	sh.minRetry, sh.maxRetry = time.Millisecond, time.Millisecond
+	if fn != nil {
+		sh.open = fn
+	}
+	t.Cleanup(func() { _ = sh.Close() })
+	return sh
+}
+
 func TestNewShards(t *testing.T) {
 	t.Parallel()
 
-	sh, err := NewShards("token", ShardPlan{Count: 3, MaxConcurrency: 1})
-	if err != nil {
-		t.Fatalf("NewShards() error = %v", err)
-	}
+	sh := testShards(t, 3, nil)
 	if len(sh.sessions) != 3 {
 		t.Fatalf("sessions = %d, want 3", len(sh.sessions))
 	}
@@ -96,70 +127,155 @@ func TestNewShards(t *testing.T) {
 		if s.Ratelimiter != sh.Session().Ratelimiter {
 			t.Errorf("session %d has its own rate limiter, want a shared one", i)
 		}
-	}
-	if err := sh.Close(); err != nil {
-		t.Errorf("Close() on unopened shards error = %v", err)
-	}
-}
-
-func TestOpenBatchesPacesIdentifyBuckets(t *testing.T) {
-	t.Parallel()
-
-	const interval = 20 * time.Millisecond
-	// Each call writes its own element, so the slice needs no lock.
-	opened := make([]time.Time, 5)
-	start := time.Now()
-	err := openBatches(t.Context(), len(opened), 2, interval, func(i int) error {
-		opened[i] = time.Now()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("openBatches() error = %v", err)
-	}
-
-	// Shards 0-1, 2-3 and 4 form three batches.
-	for i, at := range opened {
-		batch := i / 2
-		if elapsed := at.Sub(start); elapsed < time.Duration(batch)*interval {
-			t.Errorf("shard %d opened after %v, want at least %v", i, elapsed, time.Duration(batch)*interval)
+		if s.ShouldReconnectOnError {
+			t.Errorf("session %d reconnects on its own, want Shards to do it", i)
 		}
 	}
 }
 
-func TestOpenBatchesStopsOnError(t *testing.T) {
+func TestOpenRetriesTransientFailures(t *testing.T) {
 	t.Parallel()
 
-	fail := errors.New("boom")
-	var calls []int
-	err := openBatches(t.Context(), 4, 1, time.Millisecond, func(i int) error {
-		calls = append(calls, i)
-		if i == 1 {
-			return fail
+	var attempts [2]atomic.Int32
+	sh := testShards(t, 2, func(i int) error {
+		if attempts[i].Add(1) < 3 && i == 1 {
+			return io.ErrUnexpectedEOF
 		}
 		return nil
 	})
-	if !errors.Is(err, fail) {
-		t.Fatalf("openBatches() error = %v, want %v", err, fail)
+	if err := sh.Open(t.Context()); err != nil {
+		t.Fatalf("Open() error = %v", err)
 	}
-	if !slices.Equal(calls, []int{0, 1}) {
-		t.Errorf("opened shards %v, want [0 1]", calls)
+	if got := attempts[1].Load(); got != 3 {
+		t.Errorf("shard 1 attempts = %d, want 3", got)
+	}
+	if got := attempts[0].Load(); got != 1 {
+		t.Errorf("shard 0 attempts = %d, want 1", got)
 	}
 }
 
-func TestOpenBatchesStopsWhenCanceled(t *testing.T) {
+func TestOpenStopsOnFatalCloseCode(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	sh := testShards(t, 2, func(i int) error {
+		// Shard 0 keeps retrying, so only shard 1's failure can end the
+		// startup.
+		if i == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		attempts.Add(1)
+		return &websocket.CloseError{Code: 4011, Text: "Sharding required."}
+	})
+
+	err := sh.Open(t.Context())
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) || closeErr.Code != 4011 {
+		t.Fatalf("Open() error = %v, want close 4011", err)
+	}
+	if !strings.Contains(err.Error(), "shard 1: sharding required") {
+		t.Errorf("Open() error = %q, want it to name the shard and reason", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("attempts = %d, want 1: a fatal close must not be retried", got)
+	}
+}
+
+func TestOpenReturnsCanceledWhenStopped(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(t.Context())
-	var calls int
-	err := openBatches(ctx, 3, 1, time.Hour, func(int) error {
-		calls++
+	sh := testShards(t, 1, func(int) error {
 		cancel()
+		return io.ErrUnexpectedEOF
+	})
+	if err := sh.Open(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestReconnectReportsFatalFailure(t *testing.T) {
+	t.Parallel()
+
+	sh := testShards(t, 1, func(int) error {
+		return &websocket.CloseError{Code: 4004, Text: "Authentication failed."}
+	})
+	sh.reconnect(0)
+
+	select {
+	case err := <-sh.Failed():
+		if !strings.Contains(err.Error(), "authentication failed") {
+			t.Errorf("Failed() = %v, want authentication failure", err)
+		}
+	default:
+		t.Fatal("Failed() received nothing")
+	}
+}
+
+func TestReconnectStopsAfterClose(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	sh := testShards(t, 1, func(int) error {
+		attempts.Add(1)
 		return nil
 	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("openBatches() error = %v, want context.Canceled", err)
+	if err := sh.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
 	}
-	if calls != 1 {
-		t.Errorf("opened %d shards, want 1", calls)
+	sh.reconnect(0)
+	if got := attempts.Load(); got != 0 {
+		t.Errorf("attempts = %d after Close, want 0", got)
+	}
+}
+
+func TestIdentifyGateSpacesBucket(t *testing.T) {
+	t.Parallel()
+
+	const interval = 30 * time.Millisecond
+	g := newIdentifyGate(2, interval)
+
+	start := time.Now()
+	// Shards 0 and 1 use different buckets, so neither waits.
+	for _, shard := range []int{0, 1} {
+		if err := g.wait(t.Context(), shard); err != nil {
+			t.Fatalf("wait(%d) error = %v", shard, err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed >= interval {
+		t.Errorf("first starts took %v, want no wait", elapsed)
+	}
+
+	// Shard 2 shares shard 0's bucket.
+	if err := g.wait(t.Context(), 2); err != nil {
+		t.Fatalf("wait(2) error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < interval {
+		t.Errorf("shard 2 started after %v, want at least %v", elapsed, interval)
+	}
+}
+
+func TestIdentifyGateWaitStopsWithContext(t *testing.T) {
+	t.Parallel()
+
+	g := newIdentifyGate(1, time.Hour)
+	if err := g.wait(t.Context(), 0); err != nil {
+		t.Fatalf("wait() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if err := g.wait(ctx, 0); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait() error = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The canceled wait must hand the slot back rather than lose it.
+	select {
+	case next := <-g.buckets[0]:
+		if time.Until(next) < 50*time.Minute {
+			t.Errorf("bucket reopens at %v, want about an hour from now", next)
+		}
+	default:
+		t.Fatal("canceled wait kept the bucket locked")
 	}
 }
