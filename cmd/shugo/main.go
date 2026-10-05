@@ -76,13 +76,12 @@ func run() error {
 	store := history.New(cfg.HistorySize, cfg.HistoryTTL)
 	go store.Run(ctx, time.Minute)
 
-	session, err := discordgo.New("Bot " + cfg.DiscordToken)
+	shards, err := newShards(cfg)
 	if err != nil {
-		return fmt.Errorf("create discord session: %w", err)
+		return err
 	}
-	session.Identify.Intents = bot.Intents
 
-	handler := bot.NewHandler(moderator, store, guilds, bot.NewSession(session), logger, bot.Options{
+	handler := bot.NewHandler(moderator, store, guilds, bot.NewSession(shards.Session()), logger, bot.Options{
 		DryRun:             cfg.DryRun,
 		TimeoutDuration:    cfg.TimeoutDuration,
 		QueueTimeout:       cfg.QueueTimeout,
@@ -98,15 +97,21 @@ func run() error {
 	defer cancelWork()
 
 	var tracker bot.Tracker
-	session.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
-	session.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
-	session.AddHandler(bot.OnGuildCreate(workCtx, guilds, logger))
-	session.AddHandler(bot.OnGuildDelete(workCtx, guilds, logger))
-	session.AddHandler(router.OnInteractionCreate(workCtx, &tracker))
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+	shards.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
+	shards.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
+	shards.AddHandler(bot.OnGuildCreate(workCtx, guilds, logger))
+	shards.AddHandler(bot.OnGuildDelete(workCtx, guilds, logger))
+	shards.AddHandler(router.OnInteractionCreate(workCtx, &tracker))
+	shards.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		logger.Info("connected to discord",
 			slog.String("user", r.User.Username),
+			slog.Int("shard", s.ShardID),
+			slog.Int("shards", s.ShardCount),
 			slog.Int("guilds", len(r.Guilds)))
+		// Commands are global, so one shard registers them for all.
+		if s.ShardID != 0 {
+			return
+		}
 		// Overwriting on every Ready is idempotent and keeps the commands in
 		// step with this build after an upgrade.
 		appID := r.User.ID
@@ -118,7 +123,9 @@ func run() error {
 		}
 	})
 
-	if err := session.Open(); err != nil {
+	// A signal during startup stops opening shards and falls through to the
+	// normal shutdown, which drains the shards that already connected.
+	if err := shards.Open(ctx); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("open discord gateway: %w", err)
 	}
 	logger.Info("shugo started",
@@ -130,7 +137,7 @@ func run() error {
 	stop()
 	logger.Info("shutting down")
 
-	closeErr := session.Close()
+	closeErr := shards.Close()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancelDrain()
 	if err := tracker.Close(drainCtx); err != nil {
@@ -141,4 +148,24 @@ func run() error {
 		return fmt.Errorf("close discord gateway: %w", closeErr)
 	}
 	return nil
+}
+
+// newShards asks Discord how to shard the bot and creates the sessions.
+//
+// Parameters:
+//   - cfg (config.Config): supplies the bot token and shard count.
+func newShards(cfg config.Config) (*bot.Shards, error) {
+	rest, err := discordgo.New("Bot " + cfg.DiscordToken)
+	if err != nil {
+		return nil, fmt.Errorf("create discord session: %w", err)
+	}
+	gateway, err := rest.GatewayBot()
+	if err != nil {
+		return nil, fmt.Errorf("query discord gateway: %w", err)
+	}
+	plan, err := bot.PlanShards(gateway, cfg.ShardCount)
+	if err != nil {
+		return nil, err
+	}
+	return bot.NewShards(cfg.DiscordToken, plan)
 }

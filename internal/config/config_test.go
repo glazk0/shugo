@@ -51,6 +51,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.Policy != moderation.DefaultPolicy {
 		t.Errorf("Policy = %+v, want default", cfg.Policy)
 	}
+	if cfg.ShardCount != 0 {
+		t.Errorf("ShardCount = %d, want 0 for Discord's recommendation", cfg.ShardCount)
+	}
 	if cfg.DryRun || cfg.DatabasePath != "shugo.db" || cfg.Warnings != nil {
 		t.Errorf("DryRun/DatabasePath/Warnings = %v/%q/%v", cfg.DryRun, cfg.DatabasePath, cfg.Warnings)
 	}
@@ -73,6 +76,7 @@ func TestLoadOverrides(t *testing.T) {
 
 	cfg, err := config.Load(env(required(map[string]string{
 		"DISCORD_TOKEN":       "Bot abc",
+		"SHARD_COUNT":         "4",
 		"JEV_MODEL":           "jev-1.13.0",
 		"LOG_CHANNEL_ID":      "123",
 		"DATABASE_PATH":       "/data/shugo.db",
@@ -96,6 +100,9 @@ func TestLoadOverrides(t *testing.T) {
 
 	if cfg.DiscordToken != "abc" {
 		t.Errorf("DiscordToken = %q, want Bot prefix stripped", cfg.DiscordToken)
+	}
+	if cfg.ShardCount != 4 {
+		t.Errorf("ShardCount = %d, want 4", cfg.ShardCount)
 	}
 	want := moderation.Policy{FlagRisk: 0.4, DeleteRisk: 0.9, TimeoutSeverity: 0.6, Suspicion: 0.7}
 	if cfg.Policy != want {
@@ -125,6 +132,7 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"TYPESAFE_API_KEY": "   ",
 		"DRY_RUN":          "maybe",
 		"HISTORY_SIZE":     "0",
+		"SHARD_COUNT":      "-1",
 		"TIMEOUT_DURATION": "29d",
 		"FLAG_RISK":        "0.95",
 		"QUEUE_TIMEOUT":    "-1s",
@@ -139,6 +147,7 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"TYPESAFE_API_KEY is required",
 		`DRY_RUN: invalid value "maybe"`,
 		"HISTORY_SIZE must be at least 1",
+		"SHARD_COUNT must be 0 or more",
 		`TIMEOUT_DURATION: invalid value "29d"`,
 		"flag risk 0.95 exceeds delete risk",
 		"QUEUE_TIMEOUT must be positive",
