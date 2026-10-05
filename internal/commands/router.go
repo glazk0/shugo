@@ -26,6 +26,9 @@ const handlerTimeout = 2 * time.Second
 type Request struct {
 	// GuildID is the guild the command was used in; "" outside guilds.
 	GuildID string
+	// AppPermissions are the bot's permissions in the channel the command
+	// was used in, as Discord reports them with the interaction.
+	AppPermissions int64
 	// Path is the invoked subcommand, such as "log-channel set"; "" for a
 	// command without subcommands.
 	Path    string
@@ -137,15 +140,17 @@ func (r *Router) Definitions() []*discordgo.ApplicationCommand {
 // Parameters:
 //   - ctx (context.Context): passed to the handler.
 //   - guildID (string): guild the command was used in.
+//   - appPermissions (int64): the bot's permissions in the channel the
+//     command was used in.
 //   - data (discordgo.ApplicationCommandInteractionData): the invocation.
-func (r *Router) Dispatch(ctx context.Context, guildID string, data discordgo.ApplicationCommandInteractionData) (string, error) {
+func (r *Router) Dispatch(ctx context.Context, guildID string, appPermissions int64, data discordgo.ApplicationCommandInteractionData) (string, error) {
 	path, opts := subcommand(data.Options)
 	handler := r.commands[data.Name].Handlers[path]
 	if handler == nil {
 		// Discord can briefly serve an outdated definition after an upgrade.
 		return "Unknown command. Discord may still be showing an outdated version of it; try again in a minute.", nil
 	}
-	return handler(ctx, Request{GuildID: guildID, Path: path, options: opts})
+	return handler(ctx, Request{GuildID: guildID, AppPermissions: appPermissions, Path: path, options: opts})
 }
 
 // OnInteractionCreate returns a discordgo handler that answers every
@@ -166,7 +171,7 @@ func (r *Router) OnInteractionCreate(ctx context.Context, tracker Tracker) func(
 		}
 
 		tracker.Do(func() {
-			reply := r.run(ctx, i.GuildID, data)
+			reply := r.run(ctx, i.GuildID, i.AppPermissions, data)
 			err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 				Type: discordgo.InteractionResponseChannelMessageWithSource,
 				Data: &discordgo.InteractionResponseData{
@@ -193,12 +198,14 @@ func (r *Router) OnInteractionCreate(ctx context.Context, tracker Tracker) func(
 // Parameters:
 //   - ctx (context.Context): parent context.
 //   - guildID (string): guild the command was used in.
+//   - appPermissions (int64): the bot's permissions in the channel the
+//     command was used in.
 //   - data (discordgo.ApplicationCommandInteractionData): the invocation.
-func (r *Router) run(ctx context.Context, guildID string, data discordgo.ApplicationCommandInteractionData) string {
+func (r *Router) run(ctx context.Context, guildID string, appPermissions int64, data discordgo.ApplicationCommandInteractionData) string {
 	runCtx, cancel := context.WithTimeout(ctx, handlerTimeout)
 	defer cancel()
 
-	reply, err := r.Dispatch(runCtx, guildID, data)
+	reply, err := r.Dispatch(runCtx, guildID, appPermissions, data)
 	if err == nil {
 		return reply
 	}
