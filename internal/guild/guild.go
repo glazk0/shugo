@@ -1,5 +1,6 @@
 // Package guild stores the settings each Discord guild configures for itself:
-// where reports go and which channels and roles moderation skips.
+// where reports go, which channels and roles moderation skips, and the
+// honeypot channel.
 package guild
 
 import (
@@ -8,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
+	"time"
 
 	"github.com/glazk0/shugo/internal/moderation"
 )
@@ -33,8 +36,18 @@ const (
 	ExemptRole ExemptionKind = "role"
 )
 
+// Honeypot purge bounds. Discord deletes at most 7 days of messages with a
+// ban.
+const (
+	// DefaultHoneypotPurge is the purge a honeypot gets when the guild picks
+	// none.
+	DefaultHoneypotPurge = 24 * time.Hour
+	// MaxHoneypotPurge is the longest purge Discord accepts.
+	MaxHoneypotPurge = 7 * 24 * time.Hour
+)
+
 // Settings is one guild's configuration. The zero value is the default:
-// reports are off and nothing is exempt.
+// reports are off, nothing is exempt and there is no honeypot.
 type Settings struct {
 	// FlagChannelID receives reports of flagged messages; empty falls back to
 	// ActionChannelID.
@@ -45,6 +58,12 @@ type Settings struct {
 	// ExemptChannelIDs and ExemptRoleIDs are sorted.
 	ExemptChannelIDs []string
 	ExemptRoleIDs    []string
+	// HoneypotChannelID is the channel where any post gets its author
+	// softbanned; empty when the guild has no honeypot.
+	HoneypotChannelID string
+	// HoneypotPurge is how far back the softban deletes the author's
+	// messages.
+	HoneypotPurge time.Duration
 }
 
 // ReportChannel returns the channel that should receive the report for an
@@ -70,6 +89,14 @@ func (s Settings) ReportChannel(a moderation.Action) string {
 //   - channelID (string): channel to check; "" is never exempt.
 func (s Settings) ExemptsChannel(channelID string) bool {
 	return channelID != "" && slices.Contains(s.ExemptChannelIDs, channelID)
+}
+
+// IsHoneypot reports whether channelID is the guild's honeypot.
+//
+// Parameters:
+//   - channelID (string): channel to check; "" is never the honeypot.
+func (s Settings) IsHoneypot(channelID string) bool {
+	return channelID != "" && channelID == s.HoneypotChannelID
 }
 
 // ExemptsAnyRole reports whether any of roleIDs is exempt.
@@ -120,11 +147,16 @@ func NewStore(db *sql.DB) *Store {
 //   - ctx (context.Context): bounds the queries.
 //   - guildID (string): guild to look up.
 func (s *Store) Get(ctx context.Context, guildID string) (Settings, error) {
-	var out Settings
+	out := Settings{HoneypotPurge: DefaultHoneypotPurge}
+	var purgeSeconds int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT flag_channel_id, action_channel_id FROM guild_settings WHERE guild_id = ?`, guildID,
-	).Scan(&out.FlagChannelID, &out.ActionChannelID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		`SELECT flag_channel_id, action_channel_id, honeypot_channel_id, honeypot_purge_seconds
+		FROM guild_settings WHERE guild_id = ?`, guildID,
+	).Scan(&out.FlagChannelID, &out.ActionChannelID, &out.HoneypotChannelID, &purgeSeconds)
+	switch {
+	case err == nil:
+		out.HoneypotPurge = time.Duration(purgeSeconds) * time.Second
+	case !errors.Is(err, sql.ErrNoRows):
 		return Settings{}, fmt.Errorf("guild: get settings for %s: %w", guildID, err)
 	}
 
@@ -176,6 +208,57 @@ func (s *Store) SetLogChannel(ctx context.Context, guildID string, kind LogKind,
 		return fmt.Errorf("guild: set %s channel for %s: %w", kind, guildID, err)
 	}
 	return nil
+}
+
+// SetHoneypot makes channelID guildID's honeypot, purging purge worth of a
+// softbanned member's messages.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the write.
+//   - guildID (string): guild to configure.
+//   - channelID (string): new honeypot channel; "" turns the honeypot off.
+//   - purge (time.Duration): how far back a softban deletes messages, in
+//     whole seconds from 0 to MaxHoneypotPurge.
+func (s *Store) SetHoneypot(ctx context.Context, guildID, channelID string, purge time.Duration) error {
+	if purge < 0 || purge > MaxHoneypotPurge || purge%time.Second != 0 {
+		return fmt.Errorf("guild: honeypot purge %s must be whole seconds between 0 and %s", purge, MaxHoneypotPurge)
+	}
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, ensureGuild, guildID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO guild_settings (guild_id, honeypot_channel_id, honeypot_purge_seconds) VALUES (?, ?, ?)
+			ON CONFLICT (guild_id) DO UPDATE SET
+				honeypot_channel_id = excluded.honeypot_channel_id,
+				honeypot_purge_seconds = excluded.honeypot_purge_seconds,
+				updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+			guildID, channelID, int64(purge/time.Second))
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("guild: set honeypot for %s: %w", guildID, err)
+	}
+	return nil
+}
+
+// FormatPurge describes a honeypot purge for replies and reports, such as
+// "6 hours" or "3 days".
+//
+// Parameters:
+//   - d (time.Duration): purge to describe.
+func FormatPurge(d time.Duration) string {
+	n, unit := int64(d/time.Hour), "hour"
+	switch {
+	case d%(24*time.Hour) == 0:
+		n, unit = int64(d/(24*time.Hour)), "day"
+	case d%time.Hour != 0:
+		n, unit = int64(d/time.Minute), "minute"
+	}
+	if n != 1 {
+		unit += "s"
+	}
+	return strconv.FormatInt(n, 10) + " " + unit
 }
 
 // AddExemption exempts a channel or role in guildID. It reports false when

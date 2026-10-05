@@ -48,6 +48,11 @@ type timeoutCall struct {
 	until           time.Time
 }
 
+type banCall struct {
+	guildID, userID string
+	purge           time.Duration
+}
+
 // fakeDiscord records enforcement calls and can be told to fail them.
 type fakeDiscord struct {
 	mu sync.Mutex
@@ -60,6 +65,11 @@ type fakeDiscord struct {
 	reportChannels []string
 	deleteErr      error
 	timeoutErr     error
+	bans           []banCall
+	// unbans holds the user ID of each unban, in call order.
+	unbans   []string
+	banErr   error
+	unbanErr error
 }
 
 // DeleteMessage implements bot.Discord.
@@ -91,6 +101,37 @@ func (f *fakeDiscord) TimeoutMember(ctx context.Context, guildID, userID string,
 	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	f.timeouts = append(f.timeouts, timeoutCall{guildID, userID, until})
 	return f.timeoutErr
+}
+
+// BanMember implements bot.Discord.
+//
+// Parameters:
+//   - ctx (context.Context): its error is recorded.
+//   - guildID (string): recorded.
+//   - userID (string): recorded.
+//   - purge (time.Duration): recorded.
+//   - _ (string): reason, unused.
+func (f *fakeDiscord) BanMember(ctx context.Context, guildID, userID string, purge time.Duration, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	f.bans = append(f.bans, banCall{guildID, userID, purge})
+	return f.banErr
+}
+
+// UnbanMember implements bot.Discord.
+//
+// Parameters:
+//   - ctx (context.Context): its error is recorded.
+//   - _ (string): guild ID, unused.
+//   - userID (string): recorded.
+//   - _ (string): reason, unused.
+func (f *fakeDiscord) UnbanMember(ctx context.Context, _, userID, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
+	f.unbans = append(f.unbans, userID)
+	return f.unbanErr
 }
 
 // SendReport implements bot.Discord.
@@ -509,6 +550,192 @@ func TestHandleSeesConcurrentMessagesFromSameAuthor(t *testing.T) {
 	if len(lengths) != n {
 		t.Errorf("history lengths = %v, want each of 0..%d exactly once", lengths, n-1)
 	}
+}
+
+// honeypotSettings makes "trap" the honeypot, purging 6 hours, and exempts
+// the "trusted" role and the "bots" and "trap" channels. Exempting the
+// honeypot itself checks that the honeypot wins.
+var honeypotSettings = fakeSettings{settings: guild.Settings{
+	FlagChannelID:     "flags",
+	ActionChannelID:   "actions",
+	ExemptChannelIDs:  []string{"bots", "trap"},
+	ExemptRoleIDs:     []string{"trusted"},
+	HoneypotChannelID: "trap",
+	HoneypotPurge:     6 * time.Hour,
+}}
+
+func TestHandleSoftbansHoneypotPosters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*bot.Message)
+	}{
+		{"message", func(*bot.Message) {}},
+		{"thread in the honeypot", func(m *bot.Message) { m.ChannelID, m.ParentChannelID = "thread", "trap" }},
+		{"exempt role", func(m *bot.Message) { m.RoleIDs = []string{"trusted"} }},
+		{"attachment only", func(m *bot.Message) { m.Content, m.Attachments = "", 1 }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h, mod, dc := setupWithSettings(moderation.Verdict{}, defaultOpts, honeypotSettings)
+			msg := message("1", "hello")
+			msg.ChannelID = "trap"
+			tt.mutate(&msg)
+
+			if err := h.Handle(t.Context(), msg); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if mod.calls() != 0 {
+				t.Errorf("moderator called %d times, want the honeypot to skip Jev", mod.calls())
+			}
+			if len(dc.bans) != 1 || dc.bans[0] != (banCall{"g", "u", 6 * time.Hour}) {
+				t.Fatalf("bans = %+v, want u banned from g purging 6h", dc.bans)
+			}
+			if len(dc.unbans) != 1 || dc.unbans[0] != "u" {
+				t.Errorf("unbans = %v, want u unbanned", dc.unbans)
+			}
+			if len(dc.deleted)+len(dc.timeouts) != 0 {
+				t.Errorf("deleted/timeouts = %v/%v, want the ban's purge only", dc.deleted, dc.timeouts)
+			}
+			if len(dc.reports) != 1 || dc.reportChannels[0] != "actions" {
+				t.Fatalf("reports = %+v to %v, want one to the action channel", dc.reports, dc.reportChannels)
+			}
+			r := dc.reports[0]
+			if r.Softban == nil || r.Softban.Purge != 6*time.Hour || r.Softban.StillBanned || r.Err != nil || r.Message.ID != "1" {
+				t.Errorf("report = %+v, softban = %+v", r, r.Softban)
+			}
+		})
+	}
+}
+
+func TestHandleHoneypotSkips(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*bot.Message)
+	}{
+		{"moderator", func(m *bot.Message) { m.Exempt = true }},
+		{"bot author", func(m *bot.Message) { m.AuthorIsBot = true }},
+		{"edit", func(m *bot.Message) { m.Edited = true }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			h, mod, dc := setupWithSettings(moderation.Verdict{Action: moderation.ActionTimeout}, defaultOpts, honeypotSettings)
+			msg := message("1", "hello")
+			msg.ChannelID = "trap"
+			tt.mutate(&msg)
+
+			if err := h.Handle(t.Context(), msg); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if mod.calls()+len(dc.bans)+len(dc.reports) != 0 {
+				t.Errorf("acted on a skipped message: calls = %d, discord = %+v", mod.calls(), dc)
+			}
+		})
+	}
+
+	// Outside the honeypot, messages go through regular moderation.
+	h, mod, dc := setupWithSettings(moderation.Verdict{}, defaultOpts, honeypotSettings)
+	if err := h.Handle(t.Context(), message("2", "hello")); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if mod.calls() != 1 || len(dc.bans) != 0 {
+		t.Errorf("calls = %d, bans = %+v; want regular moderation", mod.calls(), dc.bans)
+	}
+}
+
+func TestHandleSoftbansOncePerBurst(t *testing.T) {
+	t.Parallel()
+
+	const n = 5
+	h, _, dc := setupWithSettings(moderation.Verdict{}, defaultOpts, honeypotSettings)
+
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			msg := message(fmt.Sprint(i), "join my server")
+			msg.ChannelID = "trap"
+			if err := h.Handle(t.Context(), msg); err != nil {
+				t.Errorf("Handle() error = %v", err)
+			}
+		})
+	}
+	wg.Wait()
+
+	if len(dc.bans) != 1 || len(dc.reports) != 1 {
+		t.Errorf("bans/reports = %d/%d, want one softban for the burst", len(dc.bans), len(dc.reports))
+	}
+
+	// Another member in the same burst gets their own softban.
+	other := message("x", "join my server")
+	other.ChannelID, other.AuthorID = "trap", "u2"
+	if err := h.Handle(t.Context(), other); err != nil {
+		t.Fatalf("Handle(other) error = %v", err)
+	}
+	if len(dc.bans) != 2 || dc.bans[1].userID != "u2" {
+		t.Errorf("bans = %+v, want u2 softbanned too", dc.bans)
+	}
+}
+
+func TestHandleSoftbanFailures(t *testing.T) {
+	t.Parallel()
+
+	t.Run("dry run only reports", func(t *testing.T) {
+		t.Parallel()
+
+		h, _, dc := setupWithSettings(moderation.Verdict{}, withDryRun(defaultOpts), honeypotSettings)
+		msg := message("1", "hello")
+		msg.ChannelID = "trap"
+		if err := h.Handle(t.Context(), msg); err != nil {
+			t.Fatalf("Handle() error = %v", err)
+		}
+		if len(dc.bans)+len(dc.unbans) != 0 || len(dc.reports) != 1 || !dc.reports[0].DryRun {
+			t.Errorf("bans/unbans/reports = %v/%v/%+v, want a dry-run report only", dc.bans, dc.unbans, dc.reports)
+		}
+	})
+
+	t.Run("failed ban skips the unban", func(t *testing.T) {
+		t.Parallel()
+
+		h, _, dc := setupWithSettings(moderation.Verdict{}, defaultOpts, honeypotSettings)
+		dc.banErr = errors.New("missing permissions")
+		msg := message("1", "hello")
+		msg.ChannelID = "trap"
+
+		if err := h.Handle(t.Context(), msg); !errors.Is(err, dc.banErr) {
+			t.Errorf("Handle() error = %v, want the ban error", err)
+		}
+		if len(dc.unbans) != 0 {
+			t.Errorf("unbans = %v, want none after a failed ban", dc.unbans)
+		}
+		if len(dc.reports) != 1 || !errors.Is(dc.reports[0].Err, dc.banErr) || dc.reports[0].Softban.StillBanned {
+			t.Errorf("reports = %+v, want the ban failure reported", dc.reports)
+		}
+	})
+
+	t.Run("failed unban reports the member still banned", func(t *testing.T) {
+		t.Parallel()
+
+		h, _, dc := setupWithSettings(moderation.Verdict{}, defaultOpts, honeypotSettings)
+		dc.unbanErr = errors.New("service unavailable")
+		msg := message("1", "hello")
+		msg.ChannelID = "trap"
+
+		if err := h.Handle(t.Context(), msg); !errors.Is(err, dc.unbanErr) {
+			t.Errorf("Handle() error = %v, want the unban error", err)
+		}
+		if len(dc.reports) != 1 || !dc.reports[0].Softban.StillBanned || !errors.Is(dc.reports[0].Err, dc.unbanErr) {
+			t.Errorf("reports = %+v, want the member reported as still banned", dc.reports)
+		}
+	})
 }
 
 // deadlineModerator waits for its context to expire, then answers anyway,

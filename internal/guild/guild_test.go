@@ -130,8 +130,9 @@ func TestGetReturnsDefaultsForUnknownGuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	if got.FlagChannelID != "" || got.ActionChannelID != "" || got.ExemptChannelIDs != nil || got.ExemptRoleIDs != nil {
-		t.Errorf("Get() = %+v, want zero settings", got)
+	if got.FlagChannelID != "" || got.ActionChannelID != "" || got.ExemptChannelIDs != nil || got.ExemptRoleIDs != nil ||
+		got.HoneypotChannelID != "" || got.HoneypotPurge != guild.DefaultHoneypotPurge {
+		t.Errorf("Get() = %+v, want default settings", got)
 	}
 }
 
@@ -172,6 +173,66 @@ func TestSetLogChannel(t *testing.T) {
 	}
 	if err := s.SetLogChannel(ctx, "g", "bogus", "c"); err == nil {
 		t.Error("SetLogChannel(bogus) error = nil, want an error")
+	}
+}
+
+func TestSetHoneypot(t *testing.T) {
+	t.Parallel()
+
+	s := newStore(t)
+	ctx := t.Context()
+
+	if err := s.SetLogChannel(ctx, "g", guild.LogActions, "actions"); err != nil {
+		t.Fatalf("SetLogChannel() error = %v", err)
+	}
+	// A guild that configured something else keeps the default purge.
+	if got, _ := s.Get(ctx, "g"); got.HoneypotChannelID != "" || got.HoneypotPurge != guild.DefaultHoneypotPurge {
+		t.Errorf("Get() before SetHoneypot = %+v", got)
+	}
+
+	if err := s.SetHoneypot(ctx, "g", "trap", 6*time.Hour); err != nil {
+		t.Fatalf("SetHoneypot() error = %v", err)
+	}
+	got, err := s.Get(ctx, "g")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if got.HoneypotChannelID != "trap" || got.HoneypotPurge != 6*time.Hour || got.ActionChannelID != "actions" {
+		t.Errorf("Get() = %+v, want trap purging 6h and the action channel kept", got)
+	}
+
+	if err := s.SetHoneypot(ctx, "g", "", guild.DefaultHoneypotPurge); err != nil {
+		t.Fatalf("clear honeypot error = %v", err)
+	}
+	if got, _ := s.Get(ctx, "g"); got.HoneypotChannelID != "" {
+		t.Errorf("after clear HoneypotChannelID = %q", got.HoneypotChannelID)
+	}
+
+	for _, purge := range []time.Duration{-time.Second, guild.MaxHoneypotPurge + time.Second, 1500 * time.Millisecond} {
+		if err := s.SetHoneypot(ctx, "g", "trap", purge); err == nil {
+			t.Errorf("SetHoneypot(purge %s) error = nil, want an error", purge)
+		}
+	}
+	if err := s.SetHoneypot(ctx, "g", "trap", guild.MaxHoneypotPurge); err != nil {
+		t.Errorf("SetHoneypot(max purge) error = %v", err)
+	}
+}
+
+func TestFormatPurge(t *testing.T) {
+	t.Parallel()
+
+	tests := map[time.Duration]string{
+		time.Hour:              "1 hour",
+		12 * time.Hour:         "12 hours",
+		24 * time.Hour:         "1 day",
+		guild.MaxHoneypotPurge: "7 days",
+		36 * time.Hour:         "36 hours",
+		90 * time.Minute:       "90 minutes",
+	}
+	for d, want := range tests {
+		if got := guild.FormatPurge(d); got != want {
+			t.Errorf("FormatPurge(%s) = %q, want %q", d, got, want)
+		}
 	}
 }
 
@@ -259,5 +320,17 @@ func TestExempts(t *testing.T) {
 	}
 	if !s.ExemptsAnyRole([]string{"x", "r"}) || s.ExemptsAnyRole([]string{"x"}) || s.ExemptsAnyRole(nil) {
 		t.Error("ExemptsAnyRole() gave the wrong answer")
+	}
+}
+
+func TestIsHoneypot(t *testing.T) {
+	t.Parallel()
+
+	s := guild.Settings{HoneypotChannelID: "trap"}
+	if !s.IsHoneypot("trap") || s.IsHoneypot("other") || s.IsHoneypot("") {
+		t.Error("IsHoneypot() gave the wrong answer")
+	}
+	if (guild.Settings{}).IsHoneypot("") {
+		t.Error("IsHoneypot(\"\") is true without a honeypot")
 	}
 }

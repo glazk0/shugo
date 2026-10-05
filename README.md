@@ -42,10 +42,13 @@ server picks with `/settings`.
 - **Predictable policy.** Jev gives probabilities, and you set the thresholds.
   The same answers always lead to the same action.
 - **Edit-aware.** Editing a harmless message into spam gets it re-moderated.
+- **Honeypot channel.** Anyone who posts in a trap channel is softbanned on
+  the spot. Raid bots and compromised accounts that post everywhere get caught,
+  and their recent messages are deleted across the server.
 - **Moderators are exempt.** Members with *Administrator* or
   *Manage Messages* are left alone, threads included.
-- **Per-server settings.** Each server picks its own report channels and
-  exempt channels and roles with `/settings`, stored in SQLite.
+- **Per-server settings.** Each server picks its own report channels,
+  honeypot, and exempt channels and roles with `/settings`, stored in SQLite.
 - **Dry-run mode.** Report what Shugo would do, without touching anything.
 - **Built for production.** A single static binary in a distroless image, with
   gateway sharding, bounded concurrency, retries with backoff, and a graceful shutdown that
@@ -88,9 +91,10 @@ It loads `.env` before starting the bot. A plain `go run` does not read
 3. Invite the bot with the `bot` and `applications.commands` scopes and these
    permissions: *View Channels*,
    *Read Message History*, *Manage Messages*, *Moderate Members*,
-   *Send Messages* and *Embed Links*.
+   *Ban Members*, *Send Messages* and *Embed Links*. *Ban Members* is only
+   used by the [honeypot](#honeypot).
 4. Move the bot's role above the roles of the members it should moderate.
-   Discord rejects timeouts on members with a higher role.
+   Discord rejects timeouts and bans on members with a higher role.
 
 ## Configuration
 
@@ -176,11 +180,40 @@ let other roles use it under *Server Settings → Integrations*.
 | `/settings log-channel clear kind` | Remove that channel |
 | `/settings exempt-channel add/remove channel` | Skip moderation in a channel and its threads |
 | `/settings exempt-role add/remove role` | Skip moderation for members with a role |
+| `/settings honeypot set channel [purge]` | Softban anyone who posts in a channel, see [Honeypot](#honeypot) |
+| `/settings honeypot clear` | Turn the honeypot off |
 
 Flags need a human, while deletes and timeouts are already done, so the two
 kinds of report can go to separate channels. When only one is set, it receives
 both. With neither set, Shugo still moderates but reports nothing. Shugo needs
 *Send Messages* and *Embed Links* in the report channels.
+
+### Honeypot
+
+A honeypot is a channel no real member has a reason to post in, such as
+`#do-not-post`. Raid bots and compromised accounts post in every channel they
+can see, so a message there gives them away. Pick the channel with
+`/settings honeypot set`, and tell members to stay out of it, for example in
+the channel topic.
+
+Shugo softbans whoever posts there. It bans them, which makes Discord delete
+their messages from every channel over the `purge` window (1 hour to 7 days,
+1 day by default), then unbans them right away so the account can rejoin once
+its owner has it back.
+
+- The honeypot does not use Jev. The post alone is the trigger, so there is no
+  API cost and no threshold to tune.
+- Threads in the honeypot channel count as the honeypot.
+- Members with *Administrator* or *Manage Messages* in the channel are left
+  alone. Exempt roles and exempt channels do **not** protect anyone here.
+- Editing an existing message does not trigger it, and a burst of messages
+  from the same member gets one softban and one report.
+- The report goes to the delete and timeout channel. If the unban fails, the
+  report says the member is still banned so a moderator can lift it.
+- `DRY_RUN=true` reports the softban without banning anyone.
+
+Shugo needs *Ban Members*, and its role must sit above the member's highest
+role. `/settings honeypot set` warns you when the permission is missing.
 
 ## How it works
 
@@ -189,8 +222,10 @@ steps:
 
 1. **Filter.** Shugo skips DMs, system messages, bots, webhooks, and members
    with *Administrator* or *Manage Messages* in the channel. A message in a
-   thread is checked against the parent channel's permissions. It also skips
-   the channels (threads included) and roles that the server exempted.
+   thread is checked against the parent channel's permissions. A message in
+   the server's [honeypot](#honeypot) softbans its author and stops here.
+   Otherwise Shugo also skips the channels (threads included) and roles that
+   the server exempted.
 2. **Remember.** The message goes into an in-memory history keyed by guild and
    member, which keeps the last `HISTORY_SIZE` messages for `HISTORY_TTL`. An
    edit replaces the original version instead of adding a second entry.
@@ -242,16 +277,17 @@ make build  # binary in bin/shugo
 | `cmd/shugo` | Wiring, signal handling, graceful shutdown |
 | `internal/config` | Environment parsing and validation |
 | `internal/database` | SQLite connection and embedded schema migrations |
-| `internal/guild` | Guilds and their settings: report channels and exemptions |
+| `internal/guild` | Guilds and their settings: report channels, exemptions and the honeypot |
 | `internal/commands` | Slash command router and one file per command, such as `/settings` |
 | `internal/jev` | Jev HTTP client with retries on 429/529/5xx |
 | `internal/history` | Bounded, TTL-based per-member message cache |
 | `internal/moderation` | State building, Jev questions, decision policy |
-| `internal/bot` | Discord adapter, message handling, enforcement, reports |
+| `internal/bot` | Discord adapter, message handling, enforcement, honeypot softbans, reports |
 
 The database holds three tables: `guilds`, kept in step with the servers
 Shugo is in (`removed_at` marks one it left, with its settings kept for a
-re-invite); `guild_settings`; and `guild_exemptions`. Each row carries
+re-invite); `guild_settings`, which also holds the honeypot channel and its
+purge window; and `guild_exemptions`. Each row carries
 `created_at`, and the mutable ones `updated_at`, as UTC ISO 8601 text. WAL
 journaling and foreign keys are enabled on every connection.
 

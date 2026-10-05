@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -73,7 +74,11 @@ func invocation(path string, opts map[string]string) discordgo.ApplicationComman
 	return discordgo.ApplicationCommandInteractionData{Name: "settings", Options: options}
 }
 
-// run invokes /settings in guild "g" and fails the test on storage errors.
+// banMembers is what a correctly invited Shugo holds for the honeypot.
+const banMembers int64 = discordgo.PermissionBanMembers
+
+// run invokes /settings in guild "g", as a bot holding Ban Members, and fails
+// the test on storage errors.
 //
 // Parameters:
 //   - t (*testing.T): fails the test on errors.
@@ -83,7 +88,7 @@ func invocation(path string, opts map[string]string) discordgo.ApplicationComman
 func run(t *testing.T, r *commands.Router, path string, opts map[string]string) string {
 	t.Helper()
 
-	reply, err := r.Dispatch(t.Context(), "g", invocation(path, opts))
+	reply, err := r.Dispatch(t.Context(), "g", banMembers, invocation(path, opts))
 	if err != nil {
 		t.Fatalf("Dispatch(%s) error = %v", path, err)
 	}
@@ -167,11 +172,89 @@ func TestSettingsExemptions(t *testing.T) {
 	}
 }
 
+func TestSettingsHoneypot(t *testing.T) {
+	t.Parallel()
+
+	store := newGuildStore(t)
+	r := newRouter(t, store)
+
+	if reply := run(t, r, "show", nil); !strings.Contains(reply, "**Honeypot:** off") {
+		t.Errorf("show on a new guild = %q, want the honeypot off", reply)
+	}
+
+	reply := run(t, r, "honeypot set", map[string]string{"channel": "trap"})
+	if !strings.Contains(reply, "<#trap>") || !strings.Contains(reply, "1 day") || strings.Contains(reply, "missing") {
+		t.Errorf("set reply = %q, want the channel and the default purge, without a permission warning", reply)
+	}
+	got, _ := store.Get(t.Context(), "g")
+	if got.HoneypotChannelID != "trap" || got.HoneypotPurge != guild.DefaultHoneypotPurge {
+		t.Fatalf("settings = %+v, want trap with the default purge", got)
+	}
+
+	run(t, r, "honeypot set", map[string]string{"channel": "trap2", "purge": "6h"})
+	got, _ = store.Get(t.Context(), "g")
+	if got.HoneypotChannelID != "trap2" || got.HoneypotPurge != 6*time.Hour {
+		t.Fatalf("settings = %+v, want trap2 purging 6 hours", got)
+	}
+	if reply := run(t, r, "show", nil); !strings.Contains(reply, "<#trap2> (deletes the last 6 hours of messages)") {
+		t.Errorf("show = %q, want the honeypot and its purge", reply)
+	}
+
+	for _, purge := range []string{"forever", "0s", "-1h", "200h"} {
+		if reply := run(t, r, "honeypot set", map[string]string{"channel": "other", "purge": purge}); !strings.Contains(reply, "Pick a purge window") {
+			t.Errorf("set with purge %q = %q, want a refusal", purge, reply)
+		}
+	}
+	if reply := run(t, r, "honeypot set", nil); reply != "Pick a channel." {
+		t.Errorf("set without channel = %q", reply)
+	}
+	if got, _ := store.Get(t.Context(), "g"); got.HoneypotChannelID != "trap2" {
+		t.Errorf("rejected sets changed the honeypot to %q", got.HoneypotChannelID)
+	}
+
+	if reply := run(t, r, "honeypot clear", nil); !strings.Contains(reply, "off") {
+		t.Errorf("clear reply = %q", reply)
+	}
+	if got, _ := store.Get(t.Context(), "g"); got.HoneypotChannelID != "" {
+		t.Errorf("after clear HoneypotChannelID = %q, want none", got.HoneypotChannelID)
+	}
+}
+
+func TestSettingsHoneypotWarnsWithoutBanPermission(t *testing.T) {
+	t.Parallel()
+
+	r := newRouter(t, newGuildStore(t))
+	tests := []struct {
+		name        string
+		permissions int64
+		wantWarning bool
+	}{
+		{"no ban permission", discordgo.PermissionSendMessages, true},
+		{"ban members", banMembers, false},
+		{"administrator", discordgo.PermissionAdministrator, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			reply, err := r.Dispatch(t.Context(), "g", tt.permissions,
+				invocation("honeypot set", map[string]string{"channel": "trap"}))
+			if err != nil {
+				t.Fatalf("Dispatch() error = %v", err)
+			}
+			if got := strings.Contains(reply, "missing the Ban Members permission"); got != tt.wantWarning {
+				t.Errorf("reply = %q, want warning %v", reply, tt.wantWarning)
+			}
+		})
+	}
+}
+
 func TestSettingsOutsideGuild(t *testing.T) {
 	t.Parallel()
 
 	r := newRouter(t, newGuildStore(t))
-	reply, err := r.Dispatch(t.Context(), "", invocation("show", nil))
+	reply, err := r.Dispatch(t.Context(), "", 0, invocation("show", nil))
 	if err != nil || !strings.Contains(reply, "server") {
 		t.Errorf("Dispatch(no guild) = %q, %v", reply, err)
 	}
@@ -182,8 +265,8 @@ func TestSettingsReturnsStorageErrors(t *testing.T) {
 
 	store := failingStore{err: errors.New("database is locked")}
 	r := newRouter(t, store)
-	for _, path := range []string{"show", "log-channel set", "log-channel clear", "exempt-channel add", "exempt-role remove"} {
-		_, err := r.Dispatch(t.Context(), "g",
+	for _, path := range []string{"show", "log-channel set", "log-channel clear", "exempt-channel add", "exempt-role remove", "honeypot set", "honeypot clear"} {
+		_, err := r.Dispatch(t.Context(), "g", 0,
 			invocation(path, map[string]string{"kind": "flags", "channel": "c", "role": "r"}))
 		if !errors.Is(err, store.err) {
 			t.Errorf("Dispatch(%s) error = %v, want the storage error", path, err)
@@ -257,4 +340,15 @@ func (f failingStore) AddExemption(context.Context, string, guild.ExemptionKind,
 //   - _ (string): target ID, unused.
 func (f failingStore) RemoveExemption(context.Context, string, guild.ExemptionKind, string) (bool, error) {
 	return false, f.err
+}
+
+// SetHoneypot implements commands.SettingsStore.
+//
+// Parameters:
+//   - _ (context.Context): unused.
+//   - _ (string): guild ID, unused.
+//   - _ (string): channel ID, unused.
+//   - _ (time.Duration): purge, unused.
+func (f failingStore) SetHoneypot(context.Context, string, string, time.Duration) error {
+	return f.err
 }

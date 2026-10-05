@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -16,6 +17,7 @@ type SettingsStore interface {
 	SetLogChannel(ctx context.Context, guildID string, kind guild.LogKind, channelID string) error
 	AddExemption(ctx context.Context, guildID string, kind guild.ExemptionKind, targetID string) (bool, error)
 	RemoveExemption(ctx context.Context, guildID string, kind guild.ExemptionKind, targetID string) (bool, error)
+	SetHoneypot(ctx context.Context, guildID, channelID string, purge time.Duration) error
 }
 
 // manageGuild hides /settings from members who cannot manage the server.
@@ -34,9 +36,9 @@ var logKindOption = &discordgo.ApplicationCommandOption{
 	},
 }
 
-// exemptChannelTypes are the channels members can post in, threads aside:
-// a thread follows its parent channel's exemption.
-var exemptChannelTypes = []discordgo.ChannelType{
+// postableChannelTypes are the channels members can post in, threads aside:
+// a thread follows its parent channel's exemption and honeypot.
+var postableChannelTypes = []discordgo.ChannelType{
 	discordgo.ChannelTypeGuildText,
 	discordgo.ChannelTypeGuildNews,
 	discordgo.ChannelTypeGuildForum,
@@ -45,8 +47,24 @@ var exemptChannelTypes = []discordgo.ChannelType{
 	discordgo.ChannelTypeGuildStageVoice,
 }
 
+// purgeOption picks how far back a honeypot softban deletes messages. The
+// choices match Discord's own ban dialog, and the values are Go durations.
+var purgeOption = &discordgo.ApplicationCommandOption{
+	Type:        discordgo.ApplicationCommandOptionString,
+	Name:        "purge",
+	Description: "How far back to delete the member's messages (default 1 day)",
+	Choices: []*discordgo.ApplicationCommandOptionChoice{
+		{Name: "1 hour", Value: "1h"},
+		{Name: "6 hours", Value: "6h"},
+		{Name: "12 hours", Value: "12h"},
+		{Name: "1 day", Value: "24h"},
+		{Name: "3 days", Value: "72h"},
+		{Name: "7 days", Value: "168h"},
+	},
+}
+
 // Settings returns the /settings command, which shows and edits a guild's
-// report channels and exemptions.
+// report channels, exemptions and honeypot.
 //
 // Parameters:
 //   - store (SettingsStore): guild settings storage.
@@ -94,6 +112,33 @@ func Settings(store SettingsStore) Command {
 				},
 				exemptGroup("exempt-channel", "channel", "Skip moderation in a channel and its threads", discordgo.ApplicationCommandOptionChannel),
 				exemptGroup("exempt-role", "role", "Skip moderation for members with a role", discordgo.ApplicationCommandOptionRole),
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommandGroup,
+					Name:        "honeypot",
+					Description: "Softban anyone who posts in a trap channel",
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionSubCommand,
+							Name:        "set",
+							Description: "Make a channel the honeypot",
+							Options: []*discordgo.ApplicationCommandOption{
+								{
+									Type:         discordgo.ApplicationCommandOptionChannel,
+									Name:         "channel",
+									Description:  "Channel where any post gets its author softbanned",
+									Required:     true,
+									ChannelTypes: postableChannelTypes,
+								},
+								purgeOption,
+							},
+						},
+						{
+							Type:        discordgo.ApplicationCommandOptionSubCommand,
+							Name:        "clear",
+							Description: "Turn the honeypot off",
+						},
+					},
+				},
 			},
 		},
 		Handlers: map[string]Handler{
@@ -104,6 +149,8 @@ func Settings(store SettingsStore) Command {
 			"exempt-channel remove": GuildOnly(s.exemptChannel(false)),
 			"exempt-role add":       GuildOnly(s.exemptRole(true)),
 			"exempt-role remove":    GuildOnly(s.exemptRole(false)),
+			"honeypot set":          GuildOnly(s.setHoneypot),
+			"honeypot clear":        GuildOnly(s.clearHoneypot),
 		},
 	}
 }
@@ -124,7 +171,7 @@ func exemptGroup(name, noun, description string, optionType discordgo.Applicatio
 			Required:    true,
 		}
 		if optionType == discordgo.ApplicationCommandOptionChannel {
-			opt.ChannelTypes = exemptChannelTypes
+			opt.ChannelTypes = postableChannelTypes
 		}
 		return []*discordgo.ApplicationCommandOption{opt}
 	}
@@ -250,6 +297,61 @@ func (c settingsCommand) exempt(ctx context.Context, guildID string, kind guild.
 	return mention + " is moderated again.", nil
 }
 
+// setHoneypot makes the chosen channel the guild's honeypot.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the write.
+//   - req (Request): the invocation, with channel and optional purge
+//     options.
+func (c settingsCommand) setHoneypot(ctx context.Context, req Request) (string, error) {
+	channelID := req.Option("channel")
+	if channelID == "" {
+		return "Pick a channel.", nil
+	}
+	purge, ok := parsePurge(req.Option("purge"))
+	if !ok {
+		return "Pick a purge window from the list.", nil
+	}
+	if err := c.store.SetHoneypot(ctx, req.GuildID, channelID, purge); err != nil {
+		return "", err
+	}
+
+	reply := fmt.Sprintf("<#%s> is now the honeypot. Shugo softbans anyone who posts there, deleting their messages from the last %s, "+
+		"and leaves members with Administrator or Manage Messages alone. "+
+		"Tell members to stay out, for example in the channel topic.",
+		channelID, guild.FormatPurge(purge))
+	if req.AppPermissions&(discordgo.PermissionBanMembers|discordgo.PermissionAdministrator) == 0 {
+		reply += "\n\n**Shugo is missing the Ban Members permission**, so the honeypot cannot ban anyone yet."
+	}
+	return reply, nil
+}
+
+// parsePurge reads the purge option, which Discord limits to the choices in
+// purgeOption. It reports false for anything else, such as a value sent by
+// an outdated command definition.
+//
+// Parameters:
+//   - v (string): option value; "" picks guild.DefaultHoneypotPurge.
+func parsePurge(v string) (time.Duration, bool) {
+	if v == "" {
+		return guild.DefaultHoneypotPurge, true
+	}
+	d, err := time.ParseDuration(v)
+	return d, err == nil && d > 0 && d <= guild.MaxHoneypotPurge
+}
+
+// clearHoneypot turns the guild's honeypot off.
+//
+// Parameters:
+//   - ctx (context.Context): bounds the write.
+//   - req (Request): the invocation.
+func (c settingsCommand) clearHoneypot(ctx context.Context, req Request) (string, error) {
+	if err := c.store.SetHoneypot(ctx, req.GuildID, "", guild.DefaultHoneypotPurge); err != nil {
+		return "", err
+	}
+	return "The honeypot is off.", nil
+}
+
 // reportName names the reports a log channel receives.
 //
 // Parameters:
@@ -270,7 +372,8 @@ func describe(s guild.Settings) string {
 	b.WriteString("**Flagged messages:** " + describeChannel(s.FlagChannelID, s.ActionChannelID, "deletes and timeouts") + "\n")
 	b.WriteString("**Deletes and timeouts:** " + describeChannel(s.ActionChannelID, s.FlagChannelID, "flagged messages") + "\n")
 	b.WriteString("**Exempt channels:** " + mentions(s.ExemptChannelIDs, "<#%s>") + "\n")
-	b.WriteString("**Exempt roles:** " + mentions(s.ExemptRoleIDs, "<@&%s>"))
+	b.WriteString("**Exempt roles:** " + mentions(s.ExemptRoleIDs, "<@&%s>") + "\n")
+	b.WriteString("**Honeypot:** " + describeHoneypot(s))
 	return b.String()
 }
 
@@ -290,6 +393,17 @@ func describeChannel(own, other, otherName string) string {
 	default:
 		return "not reported"
 	}
+}
+
+// describeHoneypot renders the guild's honeypot channel and purge window.
+//
+// Parameters:
+//   - s (guild.Settings): settings holding the honeypot.
+func describeHoneypot(s guild.Settings) string {
+	if s.HoneypotChannelID == "" {
+		return "off"
+	}
+	return fmt.Sprintf("<#%s> (deletes the last %s of messages)", s.HoneypotChannelID, guild.FormatPurge(s.HoneypotPurge))
 }
 
 // mentions renders ids with format, or "none".

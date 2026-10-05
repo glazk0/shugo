@@ -138,7 +138,7 @@ func TestDispatchRoutesBySubcommand(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := r.Dispatch(t.Context(), "g", tt.data)
+			got, err := r.Dispatch(t.Context(), "g", 0, tt.data)
 			if err != nil {
 				t.Fatalf("Dispatch() error = %v", err)
 			}
@@ -172,7 +172,7 @@ func TestRunHidesHandlerErrors(t *testing.T) {
 				t.Fatalf("NewRouter() error = %v", err)
 			}
 
-			got := r.run(t.Context(), "g", discordgo.ApplicationCommandInteractionData{Name: "ping"})
+			got := r.run(t.Context(), "g", 0, discordgo.ApplicationCommandInteractionData{Name: "ping"})
 			if !strings.Contains(got, tt.want) || strings.Contains(got, "disk") {
 				t.Errorf("run() = %q, want a generic reply containing %q", got, tt.want)
 			}
