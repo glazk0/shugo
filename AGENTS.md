@@ -9,8 +9,10 @@ and the package layout.
 ## Tech
 
 - Go, standard library first (`log/slog`, `net/http`, `database/sql`). The
-  only direct dependencies are `github.com/bwmarrin/discordgo` and
-  `modernc.org/sqlite`, a pure-Go driver that keeps the binary CGO-free.
+  only direct dependencies are `github.com/bwmarrin/discordgo`,
+  `github.com/gorilla/websocket`, discordgo's gateway transport, imported
+  only to read gateway close codes, and `modernc.org/sqlite`, a pure-Go
+  driver that keeps the binary CGO-free.
 - `internal/jev` calls Jev over plain HTTP; there is no SDK.
 - Operator configuration comes from environment variables, parsed in
   `internal/config`. Per-guild settings live in SQLite (`internal/guild`) and

@@ -48,7 +48,7 @@ server picks with `/settings`.
   exempt channels and roles with `/settings`, stored in SQLite.
 - **Dry-run mode.** Report what Shugo would do, without touching anything.
 - **Built for production.** A single static binary in a distroless image, with
-  bounded concurrency, retries with backoff, and a graceful shutdown that
+  gateway sharding, bounded concurrency, retries with backoff, and a graceful shutdown that
   finishes in-flight messages.
 
 ## Quick start
@@ -103,6 +103,7 @@ server chooses for itself are covered under
 |---|---|---|
 | `DISCORD_TOKEN` | — | Bot token (required) |
 | `TYPESAFE_API_KEY` | — | TypeSafe API key (required) |
+| `SHARD_COUNT` | `0` | Gateway shards to run; `0` uses Discord's recommendation |
 | `JEV_ENDPOINT` | `https://api.typesafe.ai/v1/systemone` | System One endpoint |
 | `JEV_MODEL` | `jev-latest` | Model alias or pinned version, e.g. `jev-1.13.0` |
 | `DATABASE_PATH` | `shugo.db` (`/data/shugo.db` in the image) | SQLite file holding per-server settings |
@@ -135,6 +136,24 @@ server loses its settings when the container is replaced.
 
 `LOG_CHANNEL_ID` is no longer read. Shugo logs a warning at startup if it is
 still set. Pick report channels with `/settings log-channel set` instead.
+
+### Sharding
+
+Discord requires a bot in 2,500 or more servers to split its gateway
+connection into shards, each serving a share of the servers. Shugo runs every
+shard in one process. By default it asks Discord how many shards to use at each
+startup. Set `SHARD_COUNT` to pin the number instead; Shugo warns when it is
+below Discord's recommendation. Shards connect as fast as Discord's
+`max_concurrency` allows, which is one every five seconds for most bots, and
+reconnects after an outage follow the same pace. A shard that fails to connect
+is retried on its own with backoff. Slash commands are registered by shard 0.
+
+Discord limits how many sessions a bot may start per day and resets the token
+of a bot that goes over. Shugo checks the remaining budget before it connects
+and refuses to start unless it covers every shard twice, which leaves each
+shard room to start a fresh session after losing one. Shugo stops when
+Discord rejects a shard for good, such as for an invalid token or a disabled
+intent, rather than retrying.
 
 ### Using OpenRouter
 
@@ -255,9 +274,9 @@ request. Pushes to `main` and `v*` tags publish a multi-arch
 
 - **History is in memory.** It resets when the bot restarts, which is fine with
   the default 15-minute TTL.
-- **One replica.** Running several would need a shared store, such as Redis,
-  behind the same `history` API, and a shared database in place of the local
-  SQLite file.
+- **One process.** Every shard runs in the same process. Splitting shards
+  across replicas would need a shared database in place of the local SQLite
+  file. The history is keyed by server, so it can stay local to each shard.
 - **Text only.** Attachment-only messages are remembered but not sent to Jev.
 
 ## Contributing

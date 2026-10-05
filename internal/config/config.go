@@ -16,7 +16,10 @@ import (
 // Config holds every runtime setting.
 type Config struct {
 	// DiscordToken is the bot token, without the "Bot " prefix.
-	DiscordToken   string
+	DiscordToken string
+	// ShardCount is how many gateway shards to run; 0 uses Discord's
+	// recommendation.
+	ShardCount     int
 	TypeSafeAPIKey string
 	JevEndpoint    string
 	JevModel       string
@@ -63,6 +66,7 @@ func Load(lookup LookupFunc) (Config, error) {
 
 	cfg := Config{
 		DiscordToken:   p.required("DISCORD_TOKEN"),
+		ShardCount:     p.int("SHARD_COUNT", 0),
 		TypeSafeAPIKey: p.required("TYPESAFE_API_KEY"),
 		JevEndpoint:    p.string("JEV_ENDPOINT", jev.DefaultEndpoint),
 		JevModel:       p.string("JEV_MODEL", jev.DefaultModel),
@@ -101,6 +105,9 @@ func Load(lookup LookupFunc) (Config, error) {
 	// Discord caps member timeouts at 28 days.
 	if cfg.TimeoutDuration <= 0 || cfg.TimeoutDuration > 28*24*time.Hour {
 		p.fail("TIMEOUT_DURATION must be between 1s and 28 days")
+	}
+	if cfg.ShardCount < 0 {
+		p.fail("SHARD_COUNT must be 0 or more")
 	}
 	if cfg.HistorySize < 1 {
 		p.fail("HISTORY_SIZE must be at least 1")

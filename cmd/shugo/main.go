@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -33,8 +34,9 @@ func main() {
 }
 
 // run loads the configuration, connects to Discord and blocks until the
-// process receives SIGINT or SIGTERM, then lets in-flight messages finish for
-// up to the shutdown timeout. A second signal stops the process immediately.
+// process receives SIGINT or SIGTERM or a shard can no longer reconnect, then
+// lets in-flight messages finish for up to the shutdown timeout. A second
+// signal stops the process immediately.
 func run() error {
 	cfg, err := config.Load(os.LookupEnv)
 	if err != nil {
@@ -76,13 +78,12 @@ func run() error {
 	store := history.New(cfg.HistorySize, cfg.HistoryTTL)
 	go store.Run(ctx, time.Minute)
 
-	session, err := discordgo.New("Bot " + cfg.DiscordToken)
+	shards, err := bot.NewShards(cfg.DiscordToken, cfg.ShardCount, logger)
 	if err != nil {
-		return fmt.Errorf("create discord session: %w", err)
+		return err
 	}
-	session.Identify.Intents = bot.Intents
 
-	handler := bot.NewHandler(moderator, store, guilds, bot.NewSession(session), logger, bot.Options{
+	handler := bot.NewHandler(moderator, store, guilds, bot.NewSession(shards.Session()), logger, bot.Options{
 		DryRun:             cfg.DryRun,
 		TimeoutDuration:    cfg.TimeoutDuration,
 		QueueTimeout:       cfg.QueueTimeout,
@@ -98,15 +99,21 @@ func run() error {
 	defer cancelWork()
 
 	var tracker bot.Tracker
-	session.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
-	session.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
-	session.AddHandler(bot.OnGuildCreate(workCtx, guilds, logger))
-	session.AddHandler(bot.OnGuildDelete(workCtx, guilds, logger))
-	session.AddHandler(router.OnInteractionCreate(workCtx, &tracker))
-	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+	shards.AddHandler(bot.OnMessageCreate(workCtx, handler, &tracker, logger))
+	shards.AddHandler(bot.OnMessageUpdate(workCtx, handler, &tracker, logger))
+	shards.AddHandler(bot.OnGuildCreate(workCtx, guilds, logger))
+	shards.AddHandler(bot.OnGuildDelete(workCtx, guilds, logger))
+	shards.AddHandler(router.OnInteractionCreate(workCtx, &tracker))
+	shards.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		logger.Info("connected to discord",
 			slog.String("user", r.User.Username),
+			slog.Int("shard", s.ShardID),
+			slog.Int("shards", s.ShardCount),
 			slog.Int("guilds", len(r.Guilds)))
+		// Commands are global, so one shard registers them for all.
+		if s.ShardID != 0 {
+			return
+		}
 		// Overwriting on every Ready is idempotent and keeps the commands in
 		// step with this build after an upgrade.
 		appID := r.User.ID
@@ -118,25 +125,34 @@ func run() error {
 		}
 	})
 
-	if err := session.Open(); err != nil {
-		return fmt.Errorf("open discord gateway: %w", err)
+	// A signal during startup stops connecting shards and goes through the
+	// same shutdown, which waits for messages the connected shards took.
+	gatewayErr := shards.Open(ctx)
+	if errors.Is(gatewayErr, context.Canceled) {
+		gatewayErr = nil
+	} else if gatewayErr == nil {
+		logger.Info("shugo started",
+			slog.String("version", version),
+			slog.String("jev_model", cfg.JevModel),
+			slog.Bool("dry_run", cfg.DryRun))
+		select {
+		case <-ctx.Done():
+		case gatewayErr = <-shards.Failed():
+		}
 	}
-	logger.Info("shugo started",
-		slog.String("version", version),
-		slog.String("jev_model", cfg.JevModel),
-		slog.Bool("dry_run", cfg.DryRun))
-
-	<-ctx.Done()
 	stop()
 	logger.Info("shutting down")
 
-	closeErr := session.Close()
+	closeErr := shards.Close()
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancelDrain()
 	if err := tracker.Close(drainCtx); err != nil {
 		logger.Warn("abandoning in-flight messages", slog.Duration("shutdown_timeout", cfg.ShutdownTimeout))
 	}
 	cancelWork()
+	if gatewayErr != nil {
+		return fmt.Errorf("discord gateway: %w", gatewayErr)
+	}
 	if closeErr != nil {
 		return fmt.Errorf("close discord gateway: %w", closeErr)
 	}
