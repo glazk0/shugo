@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/glazk0/shugo/internal/guild"
@@ -18,6 +19,12 @@ import (
 // ErrOverloaded is returned when a message waited longer than
 // Options.QueueTimeout for an evaluation slot and was dropped.
 var ErrOverloaded = errors.New("bot: moderation queue is full")
+
+// softbanCooldown is how long a softban covers its member's later messages.
+// A raider often posts a burst into the honeypot, and messages sent before
+// the ban still reach the bot afterwards; one softban and one report cover
+// them all.
+const softbanCooldown = time.Minute
 
 // Message is a guild message reduced to what moderation needs, independent
 // of the Discord library.
@@ -45,6 +52,8 @@ type Message struct {
 	AuthorIsBot bool
 	// Exempt is true for authors who moderate the channel themselves.
 	Exempt bool
+	// Edited is true when the message is an edit of an earlier one.
+	Edited bool
 }
 
 // Report describes an enforcement for the moderation log.
@@ -53,12 +62,26 @@ type Report struct {
 	Verdict moderation.Verdict
 	DryRun  bool
 	Err     error
+	// Softban is set when the message was posted in the guild's honeypot,
+	// which skips Jev; Verdict is then empty.
+	Softban *Softban
+}
+
+// Softban describes a honeypot softban: a ban that purges the member's
+// recent messages, then an unban so the account can rejoin.
+type Softban struct {
+	// Purge is how far back the ban deleted the member's messages.
+	Purge time.Duration
+	// StillBanned is true when the ban went through but the unban failed.
+	StillBanned bool
 }
 
 // Discord performs the REST calls needed to enforce verdicts.
 type Discord interface {
 	DeleteMessage(ctx context.Context, channelID, messageID, reason string) error
 	TimeoutMember(ctx context.Context, guildID, userID string, until time.Time, reason string) error
+	BanMember(ctx context.Context, guildID, userID string, purge time.Duration, reason string) error
+	UnbanMember(ctx context.Context, guildID, userID, reason string) error
 	SendReport(ctx context.Context, channelID string, r Report) error
 }
 
@@ -97,6 +120,11 @@ type Handler struct {
 	opts      Options
 	sem       chan struct{}
 	now       func() time.Time
+
+	// softbans maps "guildID/userID" to when that member's last honeypot
+	// softban started.
+	mu       sync.Mutex
+	softbans map[string]time.Time
 }
 
 // NewHandler wires a Handler together.
@@ -118,13 +146,16 @@ func NewHandler(moderator Moderator, store *history.Store, settings GuildSetting
 		opts:      opts,
 		sem:       make(chan struct{}, max(opts.MaxConcurrency, 1)),
 		now:       time.Now,
+		softbans:  make(map[string]time.Time),
 	}
 }
 
 // Handle moderates msg and enforces the resulting verdict. Messages from
 // bots, outside guilds, from exempt members, or in channels and from roles the
 // guild exempted are ignored. An edited message is handled like a new one,
-// replacing its earlier version in the history.
+// replacing its earlier version in the history. A message in the guild's
+// honeypot skips Jev and softbans its author instead, even in an exempt
+// channel or from an exempt role.
 //
 // Parameters:
 //   - ctx (context.Context): cancels evaluation and enforcement.
@@ -142,6 +173,9 @@ func (h *Handler) Handle(ctx context.Context, msg Message) error {
 			slog.String("guild_id", msg.GuildID),
 			slog.String("message_id", msg.ID),
 			slog.Any("error", err))
+	}
+	if settings.IsHoneypot(msg.ChannelID) || settings.IsHoneypot(msg.ParentChannelID) {
+		return h.softban(ctx, msg, settings)
 	}
 	if settings.ExemptsChannel(msg.ChannelID) || settings.ExemptsChannel(msg.ParentChannelID) ||
 		settings.ExemptsAnyRole(msg.RoleIDs) {
@@ -273,17 +307,112 @@ func (h *Handler) enforce(ctx context.Context, msg Message, verdict moderation.V
 		slog.Any("error", enforceErr),
 	)
 
-	if reportChannelID != "" {
-		reportCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
-		defer cancel()
-		report := Report{Message: msg, Verdict: verdict, DryRun: h.opts.DryRun, Err: enforceErr}
-		if err := h.discord.SendReport(reportCtx, reportChannelID, report); err != nil {
-			errs = append(errs, fmt.Errorf("send report: %w", err))
-		}
+	report := Report{Message: msg, Verdict: verdict, DryRun: h.opts.DryRun, Err: enforceErr}
+	if err := h.report(ctx, reportChannelID, report); err != nil {
+		errs = append(errs, err)
 	}
 
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("enforce on message %s: %w", msg.ID, err)
+	}
+	return nil
+}
+
+// softban bans the author of a honeypot message, purging their recent
+// messages in every channel, then unbans them so the account can rejoin once
+// it is back in safe hands. Edits are ignored, since the original post
+// already triggered the softban, and so are later messages within
+// softbanCooldown.
+//
+// Parameters:
+//   - ctx (context.Context): parent context for the Discord calls.
+//   - msg (Message): message posted in the honeypot.
+//   - settings (guild.Settings): the guild's settings, holding the purge
+//     window and report channels.
+func (h *Handler) softban(ctx context.Context, msg Message, settings guild.Settings) error {
+	if msg.Edited || !h.claimSoftban(msg.GuildID, msg.AuthorID) {
+		return nil
+	}
+
+	const reason = "shugo: posted in the honeypot channel"
+	outcome := &Softban{Purge: settings.HoneypotPurge}
+	var errs []error
+	if !h.opts.DryRun {
+		actCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
+		if err := h.discord.BanMember(actCtx, msg.GuildID, msg.AuthorID, outcome.Purge, reason); err != nil {
+			errs = append(errs, fmt.Errorf("ban member: %w", err))
+		} else if err := h.discord.UnbanMember(actCtx, msg.GuildID, msg.AuthorID, reason); err != nil {
+			errs = append(errs, fmt.Errorf("unban member: %w", err))
+			outcome.StillBanned = true
+		}
+		cancel()
+	}
+	enforceErr := errors.Join(errs...)
+
+	h.logger.LogAttrs(ctx, slog.LevelInfo, "honeypot softban",
+		slog.String("guild_id", msg.GuildID),
+		slog.String("channel_id", msg.ChannelID),
+		slog.String("message_id", msg.ID),
+		slog.String("author_id", msg.AuthorID),
+		slog.Duration("purge", outcome.Purge),
+		slog.Bool("still_banned", outcome.StillBanned),
+		slog.Bool("dry_run", h.opts.DryRun),
+		slog.Any("error", enforceErr),
+	)
+
+	// A softban removes the member, so it is reported with the strongest
+	// actions.
+	report := Report{Message: msg, DryRun: h.opts.DryRun, Err: enforceErr, Softban: outcome}
+	if err := h.report(ctx, settings.ReportChannel(moderation.ActionTimeout), report); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("softban author of message %s: %w", msg.ID, err)
+	}
+	return nil
+}
+
+// claimSoftban reports whether the caller should softban a member, which is
+// false while an earlier softban of theirs is within softbanCooldown. It
+// also forgets softbans past the cooldown, so the map stays small.
+//
+// Parameters:
+//   - guildID (string): guild the member posted in.
+//   - userID (string): member to softban.
+func (h *Handler) claimSoftban(guildID, userID string) bool {
+	now := h.now()
+	key := guildID + "/" + userID
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if at, ok := h.softbans[key]; ok && now.Sub(at) < softbanCooldown {
+		return false
+	}
+	for k, at := range h.softbans {
+		if now.Sub(at) >= softbanCooldown {
+			delete(h.softbans, k)
+		}
+	}
+	h.softbans[key] = now
+	return true
+}
+
+// report posts r to channelID under its own EnforcementTimeout.
+//
+// Parameters:
+//   - ctx (context.Context): parent context, not bound by the enforcement
+//     deadline.
+//   - channelID (string): channel that receives the report; "" sends none.
+//   - r (Report): enforcement to describe.
+func (h *Handler) report(ctx context.Context, channelID string, r Report) error {
+	if channelID == "" {
+		return nil
+	}
+	reportCtx, cancel := context.WithTimeout(ctx, h.opts.EnforcementTimeout)
+	defer cancel()
+	if err := h.discord.SendReport(reportCtx, channelID, r); err != nil {
+		return fmt.Errorf("send report: %w", err)
 	}
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/bwmarrin/discordgo"
 
+	"github.com/glazk0/shugo/internal/guild"
 	"github.com/glazk0/shugo/internal/moderation"
 )
 
@@ -62,6 +64,39 @@ func (d *Session) DeleteMessage(ctx context.Context, channelID, messageID, reaso
 //   - reason (string): audit log reason.
 func (d *Session) TimeoutMember(ctx context.Context, guildID, userID string, until time.Time, reason string) error {
 	return d.s.GuildMemberTimeout(guildID, userID, &until,
+		discordgo.WithContext(ctx), discordgo.WithAuditLogReason(reason))
+}
+
+// BanMember bans a member, deleting their messages from the last purge in
+// every channel.
+//
+// Parameters:
+//   - ctx (context.Context): request context.
+//   - guildID (string): guild to ban the member from.
+//   - userID (string): member to ban.
+//   - purge (time.Duration): how far back to delete their messages, at most
+//     7 days.
+//   - reason (string): audit log reason.
+func (d *Session) BanMember(ctx context.Context, guildID, userID string, purge time.Duration, reason string) error {
+	// discordgo only sends delete_message_days, which cannot express a purge
+	// of a few hours, so the request is built here.
+	body := struct {
+		DeleteMessageSeconds int64 `json:"delete_message_seconds"`
+	}{int64(purge / time.Second)}
+	_, err := d.s.RequestWithBucketID(http.MethodPut, discordgo.EndpointGuildBan(guildID, userID), body,
+		discordgo.EndpointGuildBan(guildID, ""), discordgo.WithContext(ctx), discordgo.WithAuditLogReason(reason))
+	return err
+}
+
+// UnbanMember lifts a member's ban.
+//
+// Parameters:
+//   - ctx (context.Context): request context.
+//   - guildID (string): guild the member is banned from.
+//   - userID (string): member to unban.
+//   - reason (string): audit log reason.
+func (d *Session) UnbanMember(ctx context.Context, guildID, userID, reason string) error {
+	return d.s.GuildBanDelete(guildID, userID,
 		discordgo.WithContext(ctx), discordgo.WithAuditLogReason(reason))
 }
 
@@ -175,6 +210,7 @@ func FromDiscord(m *discordgo.Message) (Message, bool) {
 		UserMentions:     len(m.Mentions),
 		MentionsEveryone: m.MentionEveryone,
 		AuthorIsBot:      m.Author.Bot || m.WebhookID != "",
+		Edited:           m.EditedTimestamp != nil,
 	}
 	if msg.SentAt.IsZero() {
 		msg.SentAt = time.Now()
@@ -283,6 +319,9 @@ func guildPermissions(guild *discordgo.Guild, userID string, roles []string) int
 // Parameters:
 //   - r (Report): enforcement to describe.
 func reportEmbed(r Report) *discordgo.MessageEmbed {
+	if r.Softban != nil {
+		return softbanEmbed(r)
+	}
 	v := r.Verdict
 
 	title, color := "Message flagged", 0xF1C40F
@@ -325,6 +364,55 @@ func reportEmbed(r Report) *discordgo.MessageEmbed {
 		Fields:      fields,
 		Timestamp:   r.Message.SentAt.UTC().Format(time.RFC3339),
 		Footer:      &discordgo.MessageEmbedFooter{Text: "Jev " + v.Model},
+	}
+}
+
+// softbanEmbed renders a honeypot softban for the moderation log channel.
+//
+// Parameters:
+//   - r (Report): softban to describe; r.Softban is set.
+func softbanEmbed(r Report) *discordgo.MessageEmbed {
+	sb := r.Softban
+
+	title, color := "Member softbanned", 0xE74C3C
+	switch {
+	case r.DryRun:
+		title = "[dry run] Would have: member softbanned"
+	case sb.StillBanned:
+		title = "Member banned"
+	}
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Author", Value: fmt.Sprintf("<@%s>", r.Message.AuthorID), Inline: true},
+		{Name: "Channel", Value: fmt.Sprintf("<#%s>", r.Message.ChannelID), Inline: true},
+		{Name: "Purge", Value: "Messages from the last " + guild.FormatPurge(sb.Purge), Inline: true},
+	}
+	if sb.StillBanned {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:  "Unban failed",
+			Value: fmt.Sprintf("**<@%s> is still banned.** Lift the ban under Server Settings → Bans to let them rejoin.", r.Message.AuthorID),
+		})
+	}
+	if r.Err != nil {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:  "Enforcement failed",
+			Value: truncateRunes(r.Err.Error(), 1000),
+		})
+		color = 0x95A5A6
+	}
+
+	description := quote(r.Message.Content)
+	if strings.TrimSpace(r.Message.Content) == "" {
+		description = fmt.Sprintf("*%d attachment(s), no text*", r.Message.Attachments)
+	}
+
+	return &discordgo.MessageEmbed{
+		Title:       title,
+		Description: description,
+		Color:       color,
+		Fields:      fields,
+		Timestamp:   r.Message.SentAt.UTC().Format(time.RFC3339),
+		Footer:      &discordgo.MessageEmbedFooter{Text: "Honeypot"},
 	}
 }
 

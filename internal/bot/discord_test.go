@@ -2,6 +2,8 @@ package bot
 
 import (
 	"errors"
+	"io"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -322,5 +324,102 @@ func TestQuoteTruncatesLongContent(t *testing.T) {
 	got := quote(strings.Repeat("a", maxReportContent+10))
 	if n := len([]rune(got)); n != maxReportContent+2 {
 		t.Errorf("quote() has %d runes, want %d", n, maxReportContent+2)
+	}
+}
+
+func TestFromDiscordMarksEdits(t *testing.T) {
+	t.Parallel()
+
+	m := gatewayMessage()
+	if msg, _ := FromDiscord(m); msg.Edited {
+		t.Error("new message marked as edited")
+	}
+	editedAt := time.Now()
+	m.EditedTimestamp = &editedAt
+	if msg, _ := FromDiscord(m); !msg.Edited {
+		t.Error("edited message not marked as edited")
+	}
+}
+
+func TestClaimSoftbanExpires(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{})
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	h.now = func() time.Time { return now }
+
+	if !h.claimSoftban("g", "u") {
+		t.Fatal("first claim = false, want true")
+	}
+	now = now.Add(softbanCooldown - time.Second)
+	if h.claimSoftban("g", "u") {
+		t.Error("claim within the cooldown = true, want false")
+	}
+	if !h.claimSoftban("other", "u") {
+		t.Error("claim in another guild = false, want true")
+	}
+	now = now.Add(time.Second)
+	if !h.claimSoftban("g", "u") {
+		t.Error("claim after the cooldown = false, want true")
+	}
+
+	now = now.Add(softbanCooldown)
+	h.claimSoftban("g", "u2")
+	if len(h.softbans) != 1 {
+		t.Errorf("softbans = %v, want expired entries forgotten", h.softbans)
+	}
+}
+
+func TestSoftbanEmbed(t *testing.T) {
+	t.Parallel()
+
+	base := Report{
+		Message: Message{ID: "m", GuildID: guildID, ChannelID: "trap", AuthorID: "u", Content: "join my server", SentAt: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)},
+	}
+
+	tests := []struct {
+		name      string
+		softban   Softban
+		dryRun    bool
+		err       error
+		wantTitle string
+		wantField string
+	}{
+		{"softban", Softban{Purge: 24 * time.Hour}, false, nil, "Member softbanned", "Messages from the last 1 day"},
+		{"dry run", Softban{Purge: 6 * time.Hour}, true, nil, "[dry run] Would have: member softbanned", "6 hours"},
+		{"ban failed", Softban{Purge: time.Hour}, false, errors.New("missing permissions"), "Member softbanned", "missing permissions"},
+		{"unban failed", Softban{Purge: time.Hour, StillBanned: true}, false, errors.New("unban member: 503"), "Member banned", "**<@u> is still banned.**"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := base
+			sb := tt.softban
+			r.Softban, r.DryRun, r.Err = &sb, tt.dryRun, tt.err
+			e := reportEmbed(r)
+
+			if e.Title != tt.wantTitle {
+				t.Errorf("Title = %q, want %q", e.Title, tt.wantTitle)
+			}
+			var values []string
+			for _, f := range e.Fields {
+				values = append(values, f.Value)
+			}
+			if joined := strings.Join(values, "|"); !strings.Contains(joined, tt.wantField) || !strings.Contains(joined, "<#trap>") {
+				t.Errorf("fields %q do not contain %q and the channel", joined, tt.wantField)
+			}
+			if e.Description != "> join my server" || e.Footer.Text != "Honeypot" {
+				t.Errorf("Description/Footer = %q/%q", e.Description, e.Footer.Text)
+			}
+		})
+	}
+
+	r := base
+	r.Message.Content, r.Message.Attachments = "", 2
+	r.Softban = &Softban{Purge: time.Hour}
+	if got := reportEmbed(r).Description; got != "*2 attachment(s), no text*" {
+		t.Errorf("attachment-only Description = %q", got)
 	}
 }
